@@ -353,9 +353,8 @@ compatibility one-pager; this records how it is implemented.
   Attachment DestinationRules are labelled
   `inference.opendatahub.io/attachment-tenant` instead of the provider's tenant
   label, so the provider's own reconciler never adopts or collects them.
-  Model-namespace provider Services keep `provider-<provider>`, since providers
-  stay model-local until
-  [RHOAIENG-90804](https://redhat.atlassian.net/browse/RHOAIENG-90804).
+  Model-namespace provider Services keep `provider-<provider>` for providers in
+  the model namespace (see [Cross-namespace providers](#cross-namespace-providers)).
   Tenant-local cleanup, and a provider's cleanup when its namespace selects
   IPP, keep the transport attachment routes use.
 - **Publication.** Each tenant keeps one overlay and one route EnvoyFilter. The
@@ -403,6 +402,52 @@ compatibility one-pager; this records how it is implemented.
   only attachments keeps its ExtProc while its overlay is unreadable. A
   single-namespace controller (`--external-model-namespace`) serves no
   attachments from other namespaces.
+
+### Cross-namespace providers
+
+A provider reference with another namespace
+([RHOAIENG-90804](https://redhat.atlassian.net/browse/RHOAIENG-90804),
+`pkg/controller/referencegrant.go`) is served only when a `ReferenceGrant` in
+the provider namespace permits `inference.opendatahub.io` `ExternalModel`s from
+the model namespace to reference that `ExternalProvider` (or all of them). An
+omitted or equal namespace stays local and needs no grant.
+
+- **Authorization.** Grants are re-evaluated on every reconcile and watched, so
+  adding a grant recovers the model and removing or narrowing it withdraws the
+  reference; a revoked reference that is being served never keeps the last
+  serving state, which is otherwise retained as before. A missing
+  and an unpermitted provider report the same `RefNotPermitted` reason (for an
+  attachment, also in its `status.gateways` result), so the reference does not
+  disclose whether the provider exists; the model's permitted references keep
+  serving. A same-named local provider never stands
+  in. The grant authorizes only this reference: credentials follow the source
+  rules below, and HTTPRoute-to-Gateway attachment still follows
+  `allowedRoutes`.
+- **Validation.** The provider is validated by the model reconciler, like an
+  attachment's provider, because its namespace may have no tenant. Its status
+  and its own namespace's transport keep their existing writer.
+- **Identifiers.** Only new forms: model-namespace Service and ServiceEntry
+  `provider-<provider>-<hash12>` (within 63 characters, labelled
+  `inference.opendatahub.io/external-provider-namespace` instead of the local
+  provider label, identity-annotated), which is also the overlay `cluster`;
+  `stable_id` `<modelNamespace>/<model>/<providerNamespace>/<provider>`; Gateway
+  DestinationRule `provider-<provider>-<hash12>`. A local provider whose name
+  produces a hashed name is refused, as is the reverse. HTTPRoute rules are keyed by
+  provider namespace and name, so same-named providers from two namespaces
+  both keep their rules and candidates.
+- **Credentials.** Inherited auth uses the provider's Secret in the provider
+  namespace; a model override uses the Secret in the model namespace, with no
+  fallback to a same-named provider-namespace Secret. The provider's own Secret
+  is required only when a reference inherits it. Secrets outside the
+  tenant namespace are delivered as credential copies, as for attachments.
+  The provider's transport lives in the model namespace, so a grant trusts it:
+  whoever can edit Services or HTTPRoutes there can redirect requests that
+  carry the provider namespace's credential.
+- **Tenant-local models.** A tenant's own model referencing another
+  namespace's provider gets the attachment DestinationRule and copy, recorded
+  on its HTTPRoute so collection keeps them; its overlay candidate is kept as
+  the tenant's own. Model-namespace transport is collected after the reconcile,
+  once no HTTPRoute in the namespace uses it.
 
 ## Scope
 
@@ -485,13 +530,15 @@ auth uses the provider-local Secret; an override uses the model-local Secret.
 Secret references remain name-only. Preserve the installed schema's accepted
 names and `auth.type: simple`; schema acceptance does not add auth behavior.
 The schema compatibility test pins the legacy MaaS validation baseline.
-Until cross-namespace authorization is implemented, the resolver skips a
-provider reference to another namespace and never substitutes a local provider.
+A provider reference to another namespace requires a `ReferenceGrant` (see
+[Cross-namespace providers](#cross-namespace-providers)) and never substitutes
+a local provider.
 
 Schema installation alone does not enable serving these fields. Attachment
 reconciliation and per-Gateway status are implemented (see
-[Gateway attachments](#gateway-attachments)); provider authorization and MaaS
-selection belong to the follow-up stories. Activation requires
+[Gateway attachments](#gateway-attachments)), as is provider authorization (see
+[Cross-namespace providers](#cross-namespace-providers)); MaaS selection
+belongs to the follow-up stories. Activation requires
 aligned packaged schemas and serving implementations, verified tenant
 cleanup/claim ownership (including shared models/providers), and the serving,
 status, MaaS and installed-package checks.
