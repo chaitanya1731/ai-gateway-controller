@@ -18,7 +18,10 @@ package consumerportal
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -141,7 +144,7 @@ func httpsListener(hostname string) map[string]any {
 	return map[string]any{"name": "https", "protocol": "HTTPS", "port": int64(443), "hostname": hostname}
 }
 
-func credentialsSecret() *corev1.Secret {
+func adminCredentialsSecret() *corev1.Secret {
 	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: CredentialsSecretName, Namespace: testInfraNamespace}}
 }
 
@@ -157,6 +160,7 @@ func managedProxyDeployment() *appsv1.Deployment {
 // and records which kinds were applied, read, and deleted.
 type recorder struct {
 	mu      sync.Mutex
+	objects map[string]*unstructured.Unstructured
 	applied []string
 	gets    []string
 	deleted []string
@@ -168,6 +172,12 @@ func (r *recorder) funcs() interceptor.Funcs {
 			if patch.Type() == types.ApplyPatchType {
 				r.mu.Lock()
 				r.applied = append(r.applied, obj.GetObjectKind().GroupVersionKind().Kind+"/"+obj.GetNamespace()+"/"+obj.GetName())
+				if u, ok := obj.(*unstructured.Unstructured); ok {
+					if r.objects == nil {
+						r.objects = map[string]*unstructured.Unstructured{}
+					}
+					r.objects[u.GetKind()] = u.DeepCopy()
+				}
 				r.mu.Unlock()
 				return nil
 			}
@@ -227,7 +237,7 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
 		newAITenant(aitenantOpts{issuer: testIssuer}),
 		newGateway(httpsListener(testHostname)),
-		credentialsSecret(),
+		adminCredentialsSecret(),
 	)
 
 	res := reconcileMTC(t, r)
@@ -294,7 +304,7 @@ func TestReconcileRequeuesUntilPrerequisitesExist(t *testing.T) {
 			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener("*.apps.example.com")),
-			credentialsSecret(),
+			adminCredentialsSecret(),
 		},
 	}
 	for name, objects := range cases {
@@ -335,7 +345,7 @@ func TestReconcileRemovesAuthProxyWhenNotWanted(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			r, rec := newReconciler(t, tc.mtc, tc.aitenant, newGateway(httpsListener(testHostname)),
-				credentialsSecret(), managedProxyDeployment())
+				adminCredentialsSecret(), managedProxyDeployment())
 
 			reconcileMTC(t, r)
 
@@ -417,5 +427,134 @@ func TestProviderCAKeysSkipsEmptyBundleKeys(t *testing.T) {
 	r, _ = newReconciler(t)
 	if keys, err := r.providerCAKeys(context.Background(), testInfraNamespace); err != nil || len(keys) != 0 {
 		t.Errorf("missing bundle: keys = %v, err = %v", keys, err)
+	}
+}
+
+func withClientSecretRef(aitenant *unstructured.Unstructured) *unstructured.Unstructured {
+	_ = unstructured.SetNestedField(aitenant.Object, map[string]any{"name": "portal-oidc", "key": "client-secret"}, "spec", "oidc", "clientSecretRef")
+	_ = unstructured.SetNestedField(aitenant.Object, "2m", "spec", "oidc", "refreshInterval")
+	return aitenant
+}
+
+func tenantClientSecret(value string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "portal-oidc", Namespace: testTenantNamespace},
+		Data:       map[string][]byte{"client-secret": []byte(value)},
+	}
+}
+
+func appliedSecretData(t *testing.T, rec *recorder) map[string]string {
+	t.Helper()
+	secret := rec.objects["Secret"]
+	if secret == nil {
+		t.Fatal("credentials Secret was not applied")
+	}
+	encoded, _, _ := unstructured.NestedStringMap(secret.Object, "data")
+	out := map[string]string{}
+	for k, v := range encoded {
+		raw, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			t.Fatalf("decode %s: %v", k, err)
+		}
+		out[k] = string(raw)
+	}
+	return out
+}
+
+func deploymentHash(rec *recorder) string {
+	hash, _, _ := unstructured.NestedString(rec.objects["Deployment"].Object, "spec", "template", "metadata", "annotations", CredentialsHashAnnotation)
+	return hash
+}
+
+func TestReconcileBuildsCredentialsFromTenantClientSecret(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		withClientSecretRef(newAITenant(aitenantOpts{issuer: testIssuer})),
+		newGateway(httpsListener(testHostname)),
+		tenantClientSecret("s3cret"),
+	)
+
+	reconcileMTC(t, r)
+
+	data := appliedSecretData(t, rec)
+	if data[keyClientID] != "test-client" || data[keyClientSecret] != "s3cret" || len(data[keyCookieSecret]) == 0 {
+		t.Errorf("credentials = %v", data)
+	}
+	if rec.objects["Secret"].GetLabels()[tenant.LabelManagedBy] != tenant.ManagedByAIGatewayController {
+		t.Error("credentials Secret is not labeled as managed by this controller")
+	}
+	if deploymentHash(rec) == "" {
+		t.Error("Deployment pod template has no credentials hash")
+	}
+	args, err := json.Marshal(rec.objects["Deployment"].Object)
+	if err != nil {
+		t.Fatalf("marshal Deployment: %v", err)
+	}
+	if !strings.Contains(string(args), "--cookie-refresh=2m0s") {
+		t.Error("refreshInterval was not applied as --cookie-refresh")
+	}
+}
+
+func TestReconcileKeepsCookieSecretAndRestartsOnRotation(t *testing.T) {
+	existing := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: CredentialsSecretName, Namespace: testInfraNamespace},
+		Data:       map[string][]byte{keyCookieSecret: []byte("keep-me")},
+	}
+	objects := func(secret string) []client.Object {
+		return []client.Object{
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			withClientSecretRef(newAITenant(aitenantOpts{issuer: testIssuer})),
+			newGateway(httpsListener(testHostname)),
+			tenantClientSecret(secret), existing.DeepCopy(),
+		}
+	}
+
+	r, rec := newReconciler(t, objects("one")...)
+	reconcileMTC(t, r)
+	if got := appliedSecretData(t, rec)[keyCookieSecret]; got != "keep-me" {
+		t.Errorf("cookie secret = %q, want preserved value", got)
+	}
+	first := deploymentHash(rec)
+
+	r, rec = newReconciler(t, objects("two")...)
+	reconcileMTC(t, r)
+	if second := deploymentHash(rec); second == first {
+		t.Error("credentials hash did not change after the client secret rotated")
+	}
+}
+
+func TestReconcileWaitsForTenantClientSecret(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		withClientSecretRef(newAITenant(aitenantOpts{issuer: testIssuer})),
+		newGateway(httpsListener(testHostname)),
+	)
+	if res := reconcileMTC(t, r); res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v", res.RequeueAfter)
+	}
+	if len(rec.applied) != 0 {
+		t.Errorf("applied %v without the tenant client Secret", rec.applied)
+	}
+}
+
+func TestCleanupDeletesOnlyManagedCredentials(t *testing.T) {
+	managed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: CredentialsSecretName, Namespace: testInfraNamespace,
+		Labels: map[string]string{tenant.LabelManagedBy: tenant.ManagedByAIGatewayController},
+	}}
+	r, _ := newReconciler(t, managed)
+	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: testInfraNamespace, Name: CredentialsSecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Errorf("managed credentials Secret still exists (err=%v)", err)
+	}
+
+	r, _ = newReconciler(t, adminCredentialsSecret())
+	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: testInfraNamespace, Name: CredentialsSecretName}, &corev1.Secret{}); err != nil {
+		t.Errorf("administrator credentials Secret was deleted: %v", err)
 	}
 }

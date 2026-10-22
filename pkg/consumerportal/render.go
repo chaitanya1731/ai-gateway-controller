@@ -18,6 +18,7 @@ package consumerportal
 
 import (
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -47,6 +48,11 @@ type Params struct {
 	// ProviderCAKeys are the non-empty odh-trusted-ca-bundle keys passed to the
 	// proxy as --provider-ca-file.
 	ProviderCAKeys []string
+	// CredentialsHash is stamped on the pod template so credential changes
+	// restart the proxy.
+	CredentialsHash string
+	// RefreshInterval is the proxy --cookie-refresh value.
+	RefreshInterval time.Duration
 }
 
 // Render substitutes the CONSUMER_PORTAL_* tokens, places every resource in
@@ -60,6 +66,7 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		"CONSUMER_PORTAL_GATEWAY_NAMESPACE", p.GatewayNamespace,
 		"CONSUMER_PORTAL_GATEWAY_NAME", p.GatewayName,
 		"CONSUMER_PORTAL_AUTHORINO_NAMESPACE", p.AuthorinoNamespace,
+		"CONSUMER_PORTAL_COOKIE_REFRESH", p.RefreshInterval.String(),
 	)
 	out := make([]unstructured.Unstructured, 0, len(resources))
 	for i := range resources {
@@ -74,6 +81,10 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		u.SetLabels(labels)
 		if u.GetKind() == "Deployment" {
 			addProviderCAFiles(u, p.ProviderCAKeys)
+			if p.CredentialsHash != "" {
+				_ = unstructured.SetNestedField(u.Object, p.CredentialsHash,
+					"spec", "template", "metadata", "annotations", CredentialsHashAnnotation)
+			}
 		}
 		out = append(out, *u)
 	}
