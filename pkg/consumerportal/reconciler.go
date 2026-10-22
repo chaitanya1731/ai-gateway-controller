@@ -221,7 +221,9 @@ func (r *Reconciler) disable(ctx context.Context, mtc *unstructured.Unstructured
 			return err
 		}
 	}
-	patch := client.MergeFrom(mtc.DeepCopy())
+	// The optimistic lock keeps this merge patch, which replaces the whole
+	// finalizers array, from dropping another controller's finalizer.
+	patch := client.MergeFromWithOptions(mtc.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	controllerutil.RemoveFinalizer(mtc, CleanupFinalizer)
 	if err := r.Client.Patch(ctx, mtc, patch); err != nil {
 		return fmt.Errorf("remove finalizer: %w", err)
@@ -255,7 +257,9 @@ func (r *Reconciler) ensureFinalizer(ctx context.Context, mtc *unstructured.Unst
 	if controllerutil.ContainsFinalizer(mtc, CleanupFinalizer) {
 		return nil
 	}
-	patch := client.MergeFrom(mtc.DeepCopy())
+	// The optimistic lock keeps this merge patch, which replaces the whole
+	// finalizers array, from dropping another controller's finalizer.
+	patch := client.MergeFromWithOptions(mtc.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	controllerutil.AddFinalizer(mtc, CleanupFinalizer)
 	return r.Client.Patch(ctx, mtc, patch)
 }
