@@ -7,6 +7,8 @@ approvers:
   - aslakknutsen
   - pierDipi
   - bartoszmajsak
+  - didierofrivia
+  - crstrn13
 reviewers:
   - nerdalert
   - jland-redhat
@@ -17,3 +19,5 @@ reviewers:
   - aslakknutsen
   - pierDipi
   - bartoszmajsak
+  - didierofrivia
+  - crstrn13
