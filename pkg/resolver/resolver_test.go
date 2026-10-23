@@ -142,7 +142,6 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 		providerType string
 		apiFormat    string
 	}{
-		{name: "Azure OpenAI", providerType: "azure-openai", apiFormat: "openai-chat"},
 		{name: "Vertex OpenAI", providerType: "vertex-openai", apiFormat: "openai-chat"},
 		{name: "Bedrock OpenAI", providerType: "bedrock-openai", apiFormat: "openai-chat"},
 		{name: "custom provider", providerType: "custom", apiFormat: "openai-chat"},
@@ -219,14 +218,14 @@ func TestResolveAllReportsUnsupportedMessagesSeparatelyFromTranslationDisabled(t
 
 func TestResolveAllSkipsUnqualifiedDisabledBinding(t *testing.T) {
 	active := ref("active", "target-a", "/v1/chat/completions")
-	disabled := withWeight(ref("azure", "target-b", "/v1/chat/completions"), 0)
+	disabled := withWeight(ref("vertex", "target-b", "/v1/chat/completions"), 0)
 	disabled.APIFormat = "openai-chat"
 	model := model("ns1", "model", active, disabled)
 	providers := []*v1alpha1.ExternalProvider{
 		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
-		provider("ns1", "azure", PhaseReady, "azure.example.com", nil),
+		provider("ns1", "vertex", PhaseReady, "vertex.example.com", nil),
 	}
-	providers[1].Spec.Provider = "azure-openai"
+	providers[1].Spec.Provider = "vertex-openai"
 
 	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
 	if err != nil {
@@ -242,13 +241,13 @@ func TestResolveAllSkipsUnqualifiedDisabledBinding(t *testing.T) {
 
 func TestResolveAllSkipsNegativeWeightUnsupportedBinding(t *testing.T) {
 	active := ref("active", "target-a", "/v1/chat/completions")
-	disabled := withWeight(ref("azure", "target-b", "/v1/chat/completions"), -1)
+	disabled := withWeight(ref("vertex", "target-b", "/v1/chat/completions"), -1)
 	model := model("ns1", "model", active, disabled)
 	providers := []*v1alpha1.ExternalProvider{
 		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
-		provider("ns1", "azure", PhaseReady, "azure.example.com", nil),
+		provider("ns1", "vertex", PhaseReady, "vertex.example.com", nil),
 	}
-	providers[1].Spec.Provider = "azure-openai"
+	providers[1].Spec.Provider = "vertex-openai"
 
 	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
 	if err != nil {
@@ -423,15 +422,23 @@ func TestResolve_ProviderNamespace(t *testing.T) {
 						provider("models", "provider", PhaseReady, "local.example.com", nil),
 						provider("shared", "provider", PhaseReady, "foreign.example.com", nil),
 					})
-					if namespace == "shared" {
-						if !errors.Is(err, ErrNoRoutes) || len(set.Routes()) != 0 {
-							t.Fatalf("foreign reference resolved: set=%#v err=%v", set, err)
+					if err != nil || len(set.Routes()) != 1 {
+						t.Fatalf("set=%#v err=%v", set, err)
+					}
+					route := set.Routes()[0]
+					if namespace != "shared" {
+						if route.Endpoint != "local.example.com" || route.CrossNamespace() || route.Cluster != "provider-provider" || route.SecretRefNamespace() != "models" {
+							t.Fatalf("local reference = %#v", route)
 						}
-						if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipRefNamespaceUnsupported {
-							t.Fatalf("foreign reference skips = %#v", set.Models[0].Skips)
-						}
-					} else if err != nil || len(set.Routes()) != 1 || set.Routes()[0].Endpoint != "local.example.com" {
-						t.Fatalf("local reference: set=%#v err=%v", set, err)
+						return
+					}
+					// Never the same-named local provider; the inherited
+					// credential stays in the provider namespace.
+					if route.Endpoint != "foreign.example.com" || route.ProviderNamespace != "shared" || route.SecretRefNamespace() != "shared" {
+						t.Fatalf("foreign reference = %#v", route)
+					}
+					if route.Cluster != route.ServiceName() || !strings.HasPrefix(route.Cluster, "provider-provider-") || len(route.Cluster) != len("provider-provider-")+12 {
+						t.Fatalf("foreign cluster = %q, want the hashed Service name", route.Cluster)
 					}
 				})
 			}
@@ -439,7 +446,7 @@ func TestResolve_ProviderNamespace(t *testing.T) {
 	}
 }
 
-func TestResolve_UnsupportedNamespaceKeepsLocalRefs(t *testing.T) {
+func TestResolve_UnpermittedNamespaceKeepsLocalRefs(t *testing.T) {
 	foreign := ref("provider", "foreign-target", "/v1/chat/completions")
 	foreign.Ref.Namespace = "shared"
 	m := model("models", "model", foreign, ref("provider", "local-target", "/v1/chat/completions"))
@@ -449,6 +456,43 @@ func TestResolve_UnsupportedNamespaceKeepsLocalRefs(t *testing.T) {
 		if err != nil || len(set.Routes()) != 1 || set.Routes()[0].TargetModel != "local-target" {
 			t.Fatalf("mixed references: set=%#v err=%v", set, err)
 		}
+		skips := set.Models[0].Skips
+		if len(skips) != 1 || skips[0].Reason != SkipRefNotPermitted || !strings.Contains(skips[0].Message, "shared/provider is not found or not permitted") {
+			t.Fatalf("unpermitted reference skips = %#v", skips)
+		}
+	}
+}
+
+func TestResolve_SameNamedProvidersFromTwoNamespaces(t *testing.T) {
+	a, b := ref("openai", "gpt", "/v1/chat/completions"), ref("openai", "gpt", "/v1/chat/completions")
+	a.Ref.Namespace, b.Ref.Namespace = "ns-a", "ns-b"
+	overridden := v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	b.Auth = &overridden
+	set, err := Resolve([]*v1alpha1.ExternalModel{model("models", "model", a, b)}, []*v1alpha1.ExternalProvider{
+		provider("ns-a", "openai", PhaseReady, "a.example.com", nil),
+		provider("ns-b", "openai", PhaseReady, "b.example.com", nil),
+	})
+	if err != nil || len(set.Routes()) != 2 {
+		t.Fatalf("set=%#v err=%v", set, err)
+	}
+	routeA, routeB := set.Routes()[0], set.Routes()[1]
+	if routeA.Cluster == routeB.Cluster || routeA.Endpoint != "a.example.com" || routeB.Endpoint != "b.example.com" {
+		t.Fatalf("same-named providers are not distinct: %#v %#v", routeA, routeB)
+	}
+	// Inherited auth uses the provider namespace; an override the model namespace.
+	if routeA.SecretName != "openai-key" || routeA.SecretRefNamespace() != "ns-a" || routeB.SecretName != "model-key" || routeB.SecretRefNamespace() != "models" {
+		t.Fatalf("credential sources = %s/%s and %s/%s", routeA.SecretRefNamespace(), routeA.SecretName, routeB.SecretRefNamespace(), routeB.SecretName)
+	}
+}
+
+func TestRouteServiceNameFitsServiceNameLimit(t *testing.T) {
+	route := Route{Namespace: "models", ProviderNamespace: "shared", Provider: strings.Repeat("p", 253)}
+	if name := route.ServiceName(); len(name) != 63 || !strings.HasPrefix(name, "provider-ppp") {
+		t.Fatalf("ServiceName() = %q (%d characters)", name, len(name))
+	}
+	route.ProviderNamespace = "other"
+	if other := route.ServiceName(); other == (Route{Namespace: "models", ProviderNamespace: "shared", Provider: route.Provider}).ServiceName() {
+		t.Fatalf("providers from different namespaces share Service name %q", other)
 	}
 }
 
