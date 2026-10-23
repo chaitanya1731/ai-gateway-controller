@@ -30,6 +30,7 @@ import (
 const (
 	TrustedCABundleConfigMap = "odh-trusted-ca-bundle"
 	trustedCAMountPath       = "/etc/pki/odh-trusted-ca"
+	CABundleHashAnnotation   = "ai-gateway-controller.opendatahub.io/ca-bundle-hash"
 )
 
 // TrustedCABundleKeys are the odh-trusted-ca-bundle keys the proxy may trust:
@@ -48,6 +49,9 @@ type Params struct {
 	// ProviderCAKeys are the non-empty odh-trusted-ca-bundle keys passed to the
 	// proxy as --provider-ca-file.
 	ProviderCAKeys []string
+	// CABundleHash is stamped on the pod template so trusted CA bundle changes
+	// restart the proxy.
+	CABundleHash string
 	// CredentialsHash is stamped on the pod template so credential changes
 	// restart the proxy.
 	CredentialsHash string
@@ -81,6 +85,10 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		u.SetLabels(labels)
 		if u.GetKind() == "Deployment" {
 			addProviderCAFiles(u, p.ProviderCAKeys)
+			if p.CABundleHash != "" {
+				_ = unstructured.SetNestedField(u.Object, p.CABundleHash,
+					"spec", "template", "metadata", "annotations", CABundleHashAnnotation)
+			}
 			if p.CredentialsHash != "" {
 				_ = unstructured.SetNestedField(u.Object, p.CredentialsHash,
 					"spec", "template", "metadata", "annotations", CredentialsHashAnnotation)
