@@ -75,6 +75,7 @@ func main() {
 		authProxyImage       string
 		portalManifestPath   string
 		authorinoNamespace   string
+		dashboardNamespace   string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to.")
@@ -114,6 +115,8 @@ func main() {
 		"Path to the kustomize entrypoint for the consumer portal auth proxy resources.")
 	flag.StringVar(&authorinoNamespace, "authorino-namespace", consumerportal.DefaultAuthorinoNamespace,
 		"Namespace of the Authorino pods allowed to reach the consumer portal auth proxy.")
+	flag.StringVar(&dashboardNamespace, "consumer-portal-dashboard-namespace", consumerportal.DefaultDashboardNamespace,
+		"Namespace containing the consumer portal Service.")
 
 	opts := zap.Options{}
 	if err := applyLogDevelopment(&opts, os.Stderr); err != nil {
@@ -191,6 +194,7 @@ func main() {
 		ManifestPath:       portalManifestPath,
 		Image:              authProxyImage,
 		AuthorinoNamespace: authorinoNamespace,
+		DashboardNamespace: dashboardNamespace,
 		ResyncInterval:     resyncInterval,
 		Log:                ctrl.Log.WithName("consumer-portal"),
 	}
