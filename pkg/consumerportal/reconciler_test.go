@@ -410,23 +410,115 @@ func TestMaasTenantConfigForAITenantOnlyMapsDefaultTenant(t *testing.T) {
 }
 
 func TestProviderCAKeysSkipsEmptyBundleKeys(t *testing.T) {
-	const cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
-	bundle := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: TrustedCABundleConfigMap, Namespace: testInfraNamespace},
-		Data:       map[string]string{"ca-bundle.crt": cert, "odh-ca-bundle.crt": "\n"},
-	}
+	bundle := trustedCABundle("one")
 	r, _ := newReconciler(t, bundle)
-	keys, err := r.providerCAKeys(context.Background(), testInfraNamespace)
+	keys, hash, err := r.providerCAKeys(context.Background(), testInfraNamespace)
 	if err != nil {
 		t.Fatalf("providerCAKeys: %v", err)
 	}
 	if len(keys) != 1 || keys[0] != "ca-bundle.crt" {
 		t.Errorf("keys = %v, want [ca-bundle.crt]", keys)
 	}
+	if hash == "" {
+		t.Error("providerCAKeys returned no hash for a non-empty CA bundle")
+	}
 
 	r, _ = newReconciler(t)
-	if keys, err := r.providerCAKeys(context.Background(), testInfraNamespace); err != nil || len(keys) != 0 {
-		t.Errorf("missing bundle: keys = %v, err = %v", keys, err)
+	if keys, hash, err := r.providerCAKeys(context.Background(), testInfraNamespace); err != nil || len(keys) != 0 || hash != "" {
+		t.Errorf("missing bundle: keys = %v, hash = %q, err = %v", keys, hash, err)
+	}
+}
+
+func trustedCABundle(content string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: TrustedCABundleConfigMap, Namespace: testInfraNamespace},
+		Data: map[string]string{
+			"ca-bundle.crt":     "-----BEGIN CERTIFICATE-----\n" + content + "\n-----END CERTIFICATE-----\n",
+			"odh-ca-bundle.crt": "\n",
+		},
+	}
+}
+
+func TestReconcileRollsProxyWhenTrustedCABundleChanges(t *testing.T) {
+	objects := func(content string) []client.Object {
+		return []client.Object{
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener(testHostname)),
+			adminCredentialsSecret(),
+			trustedCABundle(content),
+		}
+	}
+
+	r, rec := newReconciler(t, objects("one")...)
+	reconcileMTC(t, r)
+	first, _, _ := unstructured.NestedString(rec.objects["Deployment"].Object,
+		"spec", "template", "metadata", "annotations", CABundleHashAnnotation)
+	if first == "" {
+		t.Fatal("Deployment pod template has no CA bundle hash")
+	}
+
+	r, rec = newReconciler(t, objects("two")...)
+	reconcileMTC(t, r)
+	second, _, _ := unstructured.NestedString(rec.objects["Deployment"].Object,
+		"spec", "template", "metadata", "annotations", CABundleHashAnnotation)
+	if second == first {
+		t.Errorf("CA bundle hash did not change: %q", second)
+	}
+}
+
+func TestReconcileOmitsCABundleHashWithoutBundleContent(t *testing.T) {
+	emptyBundle := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: TrustedCABundleConfigMap, Namespace: testInfraNamespace,
+	}}
+	cases := map[string][]client.Object{
+		"missing bundle": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener(testHostname)),
+			adminCredentialsSecret(),
+		},
+		"empty bundle": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener(testHostname)),
+			adminCredentialsSecret(),
+			emptyBundle,
+		},
+	}
+	for name, objects := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, rec := newReconciler(t, objects...)
+			reconcileMTC(t, r)
+			hash, _, _ := unstructured.NestedString(rec.objects["Deployment"].Object,
+				"spec", "template", "metadata", "annotations", CABundleHashAnnotation)
+			if hash != "" {
+				t.Errorf("CA bundle hash = %q, want empty", hash)
+			}
+		})
+	}
+}
+
+func TestMaasTenantConfigForCABundleFiltersConfigMaps(t *testing.T) {
+	r, _ := newReconciler(t, newMTC(tenant.DefaultAITenantName, testInfraNamespace))
+	bundle := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: TrustedCABundleConfigMap, Namespace: testInfraNamespace,
+	}}
+
+	reqs := r.maasTenantConfigForCABundle(context.Background(), bundle)
+	if len(reqs) != 1 || reqs[0].Namespace != testTenantNamespace || reqs[0].Name != tenant.MaasTenantConfigInstanceName {
+		t.Fatalf("trusted CA bundle mapped to %v", reqs)
+	}
+
+	otherName := bundle.DeepCopy()
+	otherName.SetName("other-configmap")
+	if reqs := r.maasTenantConfigForCABundle(context.Background(), otherName); len(reqs) != 0 {
+		t.Errorf("other ConfigMap name mapped to %v", reqs)
+	}
+	otherNamespace := bundle.DeepCopy()
+	otherNamespace.SetNamespace("other-namespace")
+	if reqs := r.maasTenantConfigForCABundle(context.Background(), otherNamespace); len(reqs) != 0 {
+		t.Errorf("other ConfigMap namespace mapped to %v", reqs)
 	}
 }
 
