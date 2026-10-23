@@ -21,6 +21,10 @@ spec:
     spec:
       serviceAccountName: maas-consumer-portal-auth-proxy
       automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: kube-auth-proxy
           image: CONSUMER_PORTAL_AUTH_PROXY_IMAGE

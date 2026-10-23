@@ -455,9 +455,10 @@ omitted or equal namespace stays local and needs no grant.
 `pkg/consumerportal` reconciles the MaaS consumer portal OIDC auth proxy
 (`kube-auth-proxy`) described in ODH-ADR-MS-0008. It watches
 `MaasTenantConfig` and the default `AITenant`, independent of the RHOAI
-Platform `GatewayConfig`. For the MVP only the default `AITenant` serves the
-portal, and only OIDC mode is implemented; OpenShift OAuth mode is follow-up
-work.
+Platform `GatewayConfig`. The MVP scope is limited to the default `AITenant`
+in OIDC mode. OpenShift OAuth mode continues to use the existing consumer
+portal route on the RHOAI Platform Gateway and requires no resources from this
+controller.
 
 When the default `AITenant` is ready, has a `status.gatewayRef`, sets
 `spec.oidc.issuerUrl`, and does not set `spec.consumerPortal.enabled: false`,
