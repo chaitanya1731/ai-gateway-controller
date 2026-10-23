@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -65,6 +67,10 @@ func testScheme() *runtime.Scheme {
 		{tenant.MaasTenantConfigGVK.Group, tenant.MaasTenantConfigGVK.Version, tenant.MaasTenantConfigGVK.Kind},
 		{tenant.AITenantGVK.Group, tenant.AITenantGVK.Version, tenant.AITenantGVK.Kind},
 		{gvkGateway.Group, gvkGateway.Version, gvkGateway.Kind},
+		{gvkHTTPRoute.Group, gvkHTTPRoute.Version, gvkHTTPRoute.Kind},
+		{gvkReferenceGrant.Group, gvkReferenceGrant.Version, gvkReferenceGrant.Kind},
+		{gvkAuthPolicy.Group, gvkAuthPolicy.Version, gvkAuthPolicy.Kind},
+		{gvkDestinationRule.Group, gvkDestinationRule.Version, gvkDestinationRule.Kind},
 	} {
 		gv := tenant.AITenantGVK.GroupVersion()
 		gv.Group, gv.Version = gvk.group, gvk.version
@@ -148,6 +154,25 @@ func adminCredentialsSecret() *corev1.Secret {
 	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: CredentialsSecretName, Namespace: testInfraNamespace}}
 }
 
+func dashboardService() *corev1.Service {
+	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name: PortalServiceName, Namespace: DefaultDashboardNamespace,
+	}}
+}
+
+func newConsumerPortalObject(gvk schema.GroupVersionKind, name, namespace string, managed bool) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(gvk)
+	object.SetName(name)
+	object.SetNamespace(namespace)
+	labels := map[string]string{"app.kubernetes.io/part-of": "maas-consumer-portal"}
+	if managed {
+		labels[tenant.LabelManagedBy] = tenant.ManagedByAIGatewayController
+	}
+	object.SetLabels(labels)
+	return object
+}
+
 func managedProxyDeployment() *appsv1.Deployment {
 	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Name:      AuthProxyName,
@@ -156,14 +181,33 @@ func managedProxyDeployment() *appsv1.Deployment {
 	}}
 }
 
-// recorder short-circuits server-side apply (unsupported by the fake client)
-// and records which kinds were applied, read, and deleted.
+// recorder records which kinds were applied, read, and deleted while letting
+// the fake client persist every operation.
 type recorder struct {
 	mu      sync.Mutex
 	objects map[string]*unstructured.Unstructured
 	applied []string
 	gets    []string
 	deleted []string
+}
+
+func setRouteReady(route *unstructured.Unstructured) {
+	setRouteConditions(route, true, true)
+}
+
+func setRouteConditions(route *unstructured.Unstructured, accepted, resolved bool) {
+	status := func(value bool) string {
+		if value {
+			return "True"
+		}
+		return "False"
+	}
+	route.Object["status"] = map[string]any{"parents": []any{map[string]any{
+		"conditions": []any{
+			map[string]any{"type": "Accepted", "status": status(accepted)},
+			map[string]any{"type": "ResolvedRefs", "status": status(resolved)},
+		},
+	}}}
 }
 
 func (r *recorder) funcs() interceptor.Funcs {
@@ -179,6 +223,20 @@ func (r *recorder) funcs() interceptor.Funcs {
 					r.objects[u.GetKind()] = u.DeepCopy()
 				}
 				r.mu.Unlock()
+				existing, ok := obj.DeepCopyObject().(client.Object)
+				if !ok {
+					return fmt.Errorf("applied object %T is not a client object", obj)
+				}
+				err := c.Get(ctx, client.ObjectKeyFromObject(obj), existing)
+				if apierrors.IsNotFound(err) {
+					if route, ok := obj.(*unstructured.Unstructured); ok && route.GetKind() == "HTTPRoute" {
+						setRouteReady(route)
+					}
+					return c.Create(ctx, obj)
+				}
+				if err != nil {
+					return err
+				}
 				return nil
 			}
 			return c.Patch(ctx, obj, patch, opts...)
@@ -238,6 +296,7 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 		newAITenant(aitenantOpts{issuer: testIssuer}),
 		newGateway(httpsListener(testHostname)),
 		adminCredentialsSecret(),
+		dashboardService(),
 	)
 
 	res := reconcileMTC(t, r)
@@ -247,8 +306,15 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 	}
 	sort.Strings(rec.applied)
 	want := []string{
+		"AuthPolicy/" + testInfraNamespace + "/maas-consumer-portal-oauth2-anonymous",
+		"AuthPolicy/" + testInfraNamespace + "/maas-consumer-portal-session",
 		"Deployment/" + testInfraNamespace + "/" + AuthProxyName,
+		"DestinationRule/" + testGatewayNamespace + "/maas-consumer-portal-auth-proxy-backend-tls",
+		"DestinationRule/" + testGatewayNamespace + "/maas-consumer-portal-backend-tls",
+		"HTTPRoute/" + testInfraNamespace + "/" + PortalRouteName,
+		"HTTPRoute/" + testInfraNamespace + "/" + OAuthRouteName,
 		"NetworkPolicy/" + testInfraNamespace + "/" + AuthProxyName,
+		"ReferenceGrant/" + DefaultDashboardNamespace + "/maas-consumer-portal",
 		"Service/" + testInfraNamespace + "/" + AuthProxyName,
 		"ServiceAccount/" + testInfraNamespace + "/" + AuthProxyName,
 	}
@@ -275,6 +341,7 @@ func TestReconcileWaitsForCredentialsSecret(t *testing.T) {
 		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
 		newAITenant(aitenantOpts{issuer: testIssuer}),
 		newGateway(httpsListener(testHostname)),
+		dashboardService(),
 	)
 
 	res := reconcileMTC(t, r)
@@ -350,6 +417,27 @@ func TestCookieExpire(t *testing.T) {
 	}
 }
 
+func TestReconcileWaitsForDashboardService(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+	)
+
+	res := reconcileMTC(t, r)
+
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+	if len(rec.applied) != 0 {
+		t.Errorf("applied %v without the dashboard Service", rec.applied)
+	}
+	if controllerutil.ContainsFinalizer(getMTC(t, r.Client), CleanupFinalizer) {
+		t.Error("finalizer added before the dashboard Service existed")
+	}
+}
+
 func TestReconcileRequeuesUntilPrerequisitesExist(t *testing.T) {
 	cases := map[string][]client.Object{
 		"AITenant not ready": {
@@ -365,6 +453,7 @@ func TestReconcileRequeuesUntilPrerequisitesExist(t *testing.T) {
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener("*.apps.example.com")),
 			adminCredentialsSecret(),
+			dashboardService(),
 		},
 	}
 	for name, objects := range cases {
@@ -456,6 +545,75 @@ func TestCleanupLeavesUnmanagedObjects(t *testing.T) {
 	}
 }
 
+func TestRoutesReadyRequiresAcceptedAndResolvedRoutes(t *testing.T) {
+	newRoute := func(name string, accepted, resolved bool) *unstructured.Unstructured {
+		route := newConsumerPortalObject(gvkHTTPRoute, name, testInfraNamespace, true)
+		setRouteConditions(route, accepted, resolved)
+		return route
+	}
+	cases := map[string]struct {
+		accepted  bool
+		resolved  bool
+		wantReady bool
+	}{
+		"ready":            {accepted: true, resolved: true, wantReady: true},
+		"not accepted":     {accepted: false, resolved: true},
+		"unresolved pipes": {accepted: true, resolved: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, _ := newReconciler(t,
+				newRoute(PortalRouteName, tc.accepted, tc.resolved),
+				newRoute(OAuthRouteName, true, true),
+			)
+			ready, err := r.routesReady(context.Background(), testInfraNamespace)
+			if err != nil {
+				t.Fatalf("routesReady: %v", err)
+			}
+			if ready != tc.wantReady {
+				t.Errorf("routesReady = %v, want %v", ready, tc.wantReady)
+			}
+		})
+	}
+}
+
+func TestCleanupDeletesManagedConsumerPortalObjects(t *testing.T) {
+	objects := []client.Object{
+		newConsumerPortalObject(gvkHTTPRoute, PortalRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkHTTPRoute, OAuthRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkReferenceGrant, PortalRouteName, DefaultDashboardNamespace, true),
+		newConsumerPortalObject(gvkAuthPolicy, PortalRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkAuthPolicy, OAuthRouteName, testInfraNamespace, true),
+		newConsumerPortalObject(gvkDestinationRule, PortalRouteName, testGatewayNamespace, true),
+		newConsumerPortalObject(gvkDestinationRule, AuthProxyName, testGatewayNamespace, true),
+		newConsumerPortalObject(gvkHTTPRoute, "unmanaged", testInfraNamespace, false),
+	}
+	r, _ := newReconciler(t, objects...)
+
+	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	for _, object := range objects[:len(objects)-1] {
+		current := &unstructured.Unstructured{}
+		source, ok := object.(*unstructured.Unstructured)
+		if !ok {
+			t.Fatalf("cleanup object is %T, want unstructured", object)
+		}
+		current.SetGroupVersionKind(source.GroupVersionKind())
+		err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(object), current)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("managed %s %s still exists (err=%v)", current.GetKind(), client.ObjectKeyFromObject(object), err)
+		}
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(gvkHTTPRoute)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{
+		Namespace: testInfraNamespace, Name: "unmanaged",
+	}, current); err != nil {
+		t.Errorf("unmanaged HTTPRoute was deleted: %v", err)
+	}
+}
+
 func TestMaasTenantConfigForAITenantOnlyMapsDefaultTenant(t *testing.T) {
 	r := &Reconciler{}
 	if reqs := r.maasTenantConfigForAITenant(context.Background(), newAITenant(aitenantOpts{})); len(reqs) != 1 ||
@@ -506,6 +664,7 @@ func TestReconcileRollsProxyWhenTrustedCABundleChanges(t *testing.T) {
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener(testHostname)),
 			adminCredentialsSecret(),
+			dashboardService(),
 			trustedCABundle(content),
 		}
 	}
@@ -537,12 +696,14 @@ func TestReconcileOmitsCABundleHashWithoutBundleContent(t *testing.T) {
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener(testHostname)),
 			adminCredentialsSecret(),
+			dashboardService(),
 		},
 		"empty bundle": {
 			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener(testHostname)),
 			adminCredentialsSecret(),
+			dashboardService(),
 			emptyBundle,
 		},
 	}
@@ -625,6 +786,7 @@ func TestReconcileBuildsCredentialsFromTenantClientSecret(t *testing.T) {
 		withClientSecretRef(newAITenant(aitenantOpts{issuer: testIssuer})),
 		newGateway(httpsListener(testHostname)),
 		tenantClientSecret("s3cret"),
+		dashboardService(),
 	)
 
 	reconcileMTC(t, r)
@@ -662,6 +824,7 @@ func TestReconcileKeepsCookieSecretAndRestartsOnRotation(t *testing.T) {
 			withClientSecretRef(newAITenant(aitenantOpts{issuer: testIssuer})),
 			newGateway(httpsListener(testHostname)),
 			tenantClientSecret(secret), existing.DeepCopy(),
+			dashboardService(),
 		}
 	}
 

@@ -63,12 +63,22 @@ const (
 )
 
 var (
-	gvkGateway       = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
-	authProxyObjects = []schema.GroupVersionKind{
+	gvkGateway         = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
+	gvkHTTPRoute       = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+	gvkReferenceGrant  = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"}
+	gvkAuthPolicy      = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
+	gvkDestinationRule = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
+	authProxyObjects   = []schema.GroupVersionKind{
 		{Group: "apps", Version: "v1", Kind: "Deployment"},
 		{Version: "v1", Kind: "Service"},
 		{Version: "v1", Kind: "ServiceAccount"},
 		{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"},
+	}
+	consumerPortalObjects = []schema.GroupVersionKind{
+		gvkHTTPRoute,
+		gvkReferenceGrant,
+		gvkAuthPolicy,
+		gvkDestinationRule,
 	}
 )
 
@@ -84,6 +94,8 @@ type Reconciler struct {
 	Image string
 	// AuthorinoNamespace is allowed through the auth proxy NetworkPolicy.
 	AuthorinoNamespace string
+	// DashboardNamespace contains the consumer portal Service.
+	DashboardNamespace string
 	// ResyncInterval is the RequeueAfter used once the proxy is applied.
 	ResyncInterval time.Duration
 }
@@ -226,6 +238,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
+	if err := r.APIReader.Get(ctx, client.ObjectKey{
+		Namespace: r.dashboardNamespace(),
+		Name:      PortalServiceName,
+	}, &corev1.Service{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("consumer portal Service does not exist yet; will retry",
+				"namespace", r.dashboardNamespace(), "name", PortalServiceName)
+			return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("get Service %s/%s: %w", r.dashboardNamespace(), PortalServiceName, err)
+	}
+
 	if err := r.ensureFinalizer(ctx, mtc); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
 	}
@@ -251,6 +275,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	resources := Render(rendered, Params{
 		Namespace:          infraNamespace,
+		DashboardNamespace: r.dashboardNamespace(),
 		Image:              r.Image,
 		OIDCIssuerURL:      issuerURL,
 		Hostname:           hostname,
@@ -265,6 +290,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	})
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
+	}
+
+	ready, err = r.routesReady(ctx, infraNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		log.Info("consumer portal routes are not ready yet; will retry", "namespace", infraNamespace)
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	log.Info("consumer portal auth proxy applied", "namespace", infraNamespace, "hostname", hostname)
@@ -292,9 +326,76 @@ func (r *Reconciler) disable(ctx context.Context, mtc *unstructured.Unstructured
 	return nil
 }
 
+func (r *Reconciler) dashboardNamespace() string {
+	if r.DashboardNamespace == "" {
+		return DefaultDashboardNamespace
+	}
+	return r.DashboardNamespace
+}
+
+func (r *Reconciler) routesReady(ctx context.Context, namespace string) (bool, error) {
+	for _, name := range []string{PortalRouteName, OAuthRouteName} {
+		route := &unstructured.Unstructured{}
+		route.SetGroupVersionKind(gvkHTTPRoute)
+		if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route); err != nil {
+			return false, fmt.Errorf("get HTTPRoute %s/%s: %w", namespace, name, err)
+		}
+		if !routeAccepted(route) || !routeReferencesResolved(route) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func routeAccepted(route *unstructured.Unstructured) bool {
+	return routeConditionTrue(route, "Accepted")
+}
+
+func routeReferencesResolved(route *unstructured.Unstructured) bool {
+	return routeConditionTrue(route, "ResolvedRefs")
+}
+
+func routeConditionTrue(route *unstructured.Unstructured, conditionType string) bool {
+	parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents")
+	for _, parent := range parents {
+		parentMap, ok := parent.(map[string]any)
+		if !ok {
+			continue
+		}
+		conditions, _, _ := unstructured.NestedSlice(parentMap, "conditions")
+		for _, condition := range conditions {
+			conditionMap, ok := condition.(map[string]any)
+			if !ok {
+				continue
+			}
+			gotType, _, _ := unstructured.NestedString(conditionMap, "type")
+			gotStatus, _, _ := unstructured.NestedString(conditionMap, "status")
+			if gotType == conditionType && gotStatus == "True" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // cleanup deletes the auth proxy resources this controller owns. Objects
 // without the ai-gateway-controller managed-by label are left alone.
 func (r *Reconciler) cleanup(ctx context.Context, namespace string) error {
+	for _, gvk := range consumerPortalObjects {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+		if err := r.Client.List(ctx, list, client.MatchingLabels{
+			tenant.LabelManagedBy:       tenant.ManagedByAIGatewayController,
+			"app.kubernetes.io/part-of": "maas-consumer-portal",
+		}); err != nil {
+			return fmt.Errorf("list %s objects: %w", gvk.Kind, err)
+		}
+		for i := range list.Items {
+			if err := r.Client.Delete(ctx, &list.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, list.Items[i].GetNamespace(), list.Items[i].GetName(), err)
+			}
+		}
+	}
 	for _, gvk := range authProxyObjects {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(gvk)

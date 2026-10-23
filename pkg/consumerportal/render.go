@@ -31,6 +31,15 @@ const (
 	TrustedCABundleConfigMap = "odh-trusted-ca-bundle"
 	trustedCAMountPath       = "/etc/pki/odh-trusted-ca"
 	CABundleHashAnnotation   = "ai-gateway-controller.opendatahub.io/ca-bundle-hash"
+
+	// PortalRouteName is the public consumer portal route.
+	PortalRouteName = "maas-consumer-portal"
+	// OAuthRouteName is the public kube-auth-proxy sign-in route.
+	OAuthRouteName = "maas-consumer-portal-oauth2"
+	// PortalServiceName is the dashboard team's consumer portal Service.
+	PortalServiceName = "maas-portal"
+	// DefaultDashboardNamespace is where the RHOAI dashboard operands run.
+	DefaultDashboardNamespace = "redhat-ods-applications"
 )
 
 // TrustedCABundleKeys are the odh-trusted-ca-bundle keys the proxy may trust:
@@ -40,6 +49,7 @@ var TrustedCABundleKeys = []string{"ca-bundle.crt", "odh-ca-bundle.crt"}
 // Params are the per-tenant values substituted into the auth proxy manifests.
 type Params struct {
 	Namespace          string
+	DashboardNamespace string
 	Image              string
 	OIDCIssuerURL      string
 	Hostname           string
@@ -64,22 +74,37 @@ type Params struct {
 // Render substitutes the CONSUMER_PORTAL_* tokens, places every resource in
 // the infrastructure namespace, and labels it as managed by this controller.
 func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unstructured {
+	portalServiceFQDN := PortalServiceName + "." + p.DashboardNamespace + ".svc.cluster.local"
+	proxyServiceFQDN := AuthProxyName + "." + p.Namespace + ".svc.cluster.local"
 	replacer := strings.NewReplacer(
 		"CONSUMER_PORTAL_AUTH_PROXY_IMAGE", p.Image,
 		"CONSUMER_PORTAL_OIDC_ISSUER_URL", p.OIDCIssuerURL,
 		"CONSUMER_PORTAL_REDIRECT_URL", "https://"+p.Hostname+"/oauth2/callback",
 		"CONSUMER_PORTAL_COOKIE_DOMAIN", p.Hostname,
+		"CONSUMER_PORTAL_HOSTNAME", p.Hostname,
 		"CONSUMER_PORTAL_GATEWAY_NAMESPACE", p.GatewayNamespace,
 		"CONSUMER_PORTAL_GATEWAY_NAME", p.GatewayName,
 		"CONSUMER_PORTAL_AUTHORINO_NAMESPACE", p.AuthorinoNamespace,
 		"CONSUMER_PORTAL_COOKIE_REFRESH", p.RefreshInterval.String(),
 		"CONSUMER_PORTAL_COOKIE_EXPIRE", p.CookieExpire.String(),
+		"CONSUMER_PORTAL_DASHBOARD_NAMESPACE", p.DashboardNamespace,
+		"CONSUMER_PORTAL_INFRA_NAMESPACE", p.Namespace,
+		"CONSUMER_PORTAL_PORTAL_SERVICE_FQDN", portalServiceFQDN,
+		"CONSUMER_PORTAL_PROXY_SERVICE_FQDN", proxyServiceFQDN,
+		"CONSUMER_PORTAL_PROXY_URL", "https://"+proxyServiceFQDN+":4180/oauth2/auth",
 	)
 	out := make([]unstructured.Unstructured, 0, len(resources))
 	for i := range resources {
 		u := resources[i].DeepCopy()
 		replaceStrings(u.Object, replacer)
-		u.SetNamespace(p.Namespace)
+		switch u.GetKind() {
+		case "ReferenceGrant":
+			u.SetNamespace(p.DashboardNamespace)
+		case "DestinationRule":
+			u.SetNamespace(p.GatewayNamespace)
+		default:
+			u.SetNamespace(p.Namespace)
+		}
 		labels := u.GetLabels()
 		if labels == nil {
 			labels = map[string]string{}

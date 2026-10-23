@@ -123,7 +123,7 @@ rules:
 # uses HTTPRoute parent status, so no Namespace read is granted.
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["referencegrants"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # The tenant reconciler checks that an AITenant's status.gatewayRef names an
 # existing Gateway before applying praxis-extproc.
 - apiGroups: ["gateway.networking.k8s.io"]
@@ -131,6 +131,9 @@ rules:
   verbs: ["get", "list", "watch"]
 - apiGroups: ["networking.istio.io"]
   resources: ["serviceentries"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["kuadrant.io"]
+  resources: ["authpolicies"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # destinationrules already covered above (full CRUD, needed for the
 # vendored overlay's own DestinationRule), so no separate mirror rule is
