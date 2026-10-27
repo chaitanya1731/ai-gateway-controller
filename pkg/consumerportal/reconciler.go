@@ -123,6 +123,7 @@ func (r *Reconciler) maasTenantConfigForSecret(ctx context.Context, obj client.O
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind(tenant.AITenantGVK.Kind + "List"))
 	if err := r.Client.List(ctx, list); err != nil {
+		r.Log.Error(err, "unable to list AITenants while mapping Secret event")
 		return nil
 	}
 	for i := range list.Items {
@@ -225,6 +226,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
+	if err := r.ensureFinalizer(ctx, mtc); err != nil {
+		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
+	}
+
 	// The proxy cannot start without its client and cookie secrets, so wait
 	// for them instead of creating a pod that fails on a missing Secret.
 	credentialsHash, ready, err := r.reconcileCredentials(ctx, log, aitenant, infraNamespace)
@@ -238,10 +243,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	caKeys, caBundleHash, err := r.providerCAKeys(ctx, infraNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-
-	if err := r.ensureFinalizer(ctx, mtc); err != nil {
-		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
 	}
 
 	rendered, err := render.Build(r.ManifestPath)
@@ -390,8 +391,8 @@ func (r *Reconciler) providerCAKeys(ctx context.Context, namespace string) ([]st
 	var keys []string
 	sum := sha256.New()
 	for _, key := range TrustedCABundleKeys {
-		value := bundle.Data[key]
-		if strings.Contains(value, "BEGIN CERTIFICATE") {
+		value, ok := bundle.Data[key]
+		if ok && strings.Contains(value, "BEGIN CERTIFICATE") {
 			keys = append(keys, key)
 			sum.Write([]byte(value))
 		}

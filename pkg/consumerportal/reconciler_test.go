@@ -285,8 +285,18 @@ func TestReconcileWaitsForCredentialsSecret(t *testing.T) {
 	if len(rec.applied) != 0 {
 		t.Errorf("applied %v without a credentials Secret", rec.applied)
 	}
-	if controllerutil.ContainsFinalizer(getMTC(t, r.Client), CleanupFinalizer) {
-		t.Error("finalizer added before anything was deployed")
+	if !controllerutil.ContainsFinalizer(getMTC(t, r.Client), CleanupFinalizer) {
+		t.Error("cleanup finalizer was not added while credentials were pending")
+	}
+}
+
+func TestRefreshIntervalFallsBackAtCookieLifetime(t *testing.T) {
+	aitenant := newAITenant(aitenantOpts{issuer: testIssuer})
+	for _, value := range []string{"24h", "25h", "590h"} {
+		_ = unstructured.SetNestedField(aitenant.Object, value, "spec", "oidc", "refreshInterval")
+		if got := RefreshInterval(aitenant); got != DefaultRefreshInterval {
+			t.Errorf("RefreshInterval(%q) = %v, want %v", value, got, DefaultRefreshInterval)
+		}
 	}
 }
 

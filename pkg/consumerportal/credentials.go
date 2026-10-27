@@ -46,6 +46,9 @@ const (
 	// DefaultRefreshInterval refreshes the session ahead of a five-minute
 	// access token lifetime.
 	DefaultRefreshInterval = 4 * time.Minute
+	// CookieExpire mirrors --cookie-expire in the consumer portal proxy
+	// Deployment. The refresh interval must remain below that lifetime.
+	CookieExpire = 24 * time.Hour
 )
 
 // ClientSecretRef returns AITenant spec.oidc.clientSecretRef, the Secret in
@@ -61,7 +64,7 @@ func ClientSecretRef(aitenant *unstructured.Unstructured) (name, key string, ok 
 func RefreshInterval(aitenant *unstructured.Unstructured) time.Duration {
 	value, _, _ := unstructured.NestedString(aitenant.Object, "spec", "oidc", "refreshInterval")
 	interval, err := time.ParseDuration(value)
-	if err != nil || interval <= 0 {
+	if err != nil || interval <= 0 || interval >= CookieExpire {
 		return DefaultRefreshInterval
 	}
 	return interval
