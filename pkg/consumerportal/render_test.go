@@ -178,6 +178,64 @@ func TestRenderRoutesGrantAndBackendTLS(t *testing.T) {
 	}
 }
 
+func TestRenderAuthPolicies(t *testing.T) {
+	resources := renderTestResources(t)
+
+	anonymous := resources["AuthPolicy/"+OAuth2AnonymousAuthPolicyName]
+	if anonymous.GetNamespace() != testInfraNamespace {
+		t.Errorf("anonymous AuthPolicy namespace = %q, want %q", anonymous.GetNamespace(), testInfraNamespace)
+	}
+	if target, _, _ := unstructured.NestedString(anonymous.Object, "spec", "targetRef", "name"); target != OAuth2RouteName {
+		t.Errorf("anonymous targetRef name = %q, want %q", target, OAuth2RouteName)
+	}
+	if _, found, _ := unstructured.NestedMap(anonymous.Object, "spec", "rules", "authentication", "public-login", "anonymous"); !found {
+		t.Error("anonymous AuthPolicy does not enable anonymous authentication")
+	}
+
+	session := resources["AuthPolicy/"+PortalSessionAuthPolicyName]
+	if target, _, _ := unstructured.NestedString(session.Object, "spec", "targetRef", "name"); target != PortalRouteName {
+		t.Errorf("session targetRef name = %q, want %q", target, PortalRouteName)
+	}
+	rego, _, _ := unstructured.NestedString(session.Object,
+		"spec", "rules", "authorization", "session", "opa", "rego")
+	proxyURL := "https://" + AuthProxyName + "." + testInfraNamespace + ".svc.cluster.local:4180/oauth2/auth"
+	for _, want := range []string{
+		`"url": "` + proxyURL + `"`,
+		`object.get(input.context.request.http.headers, "cookie", "")`,
+		`"headers": {"Cookie": cookie}`,
+		`"tls_ca_cert_file": "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"`,
+		`"timeout": "2s"`,
+		`"cache": false`,
+		`"enable_redirect": false`,
+		`"raise_error": false`,
+		`login_location := sprintf("/oauth2/start?rd=%s", [urlquery.encode(input.context.request.http.path)])`,
+	} {
+		if !strings.Contains(rego, want) {
+			t.Errorf("session Rego missing %q:\n%s", want, rego)
+		}
+	}
+
+	forwardedValue, _, _ := unstructured.NestedString(session.Object,
+		"spec", "rules", "response", "success", "headers", "x-forwarded-access-token", "plain", "expression")
+	if forwardedValue != "auth.authorization.session.identity.access_token" {
+		t.Errorf("x-forwarded-access-token expression = %q", forwardedValue)
+	}
+	if code, _, _ := unstructured.NestedInt64(session.Object,
+		"spec", "rules", "response", "unauthorized", "code"); code != 302 {
+		t.Errorf("unauthorized code = %d, want 302", code)
+	}
+	location, _, _ := unstructured.NestedString(session.Object,
+		"spec", "rules", "response", "unauthorized", "headers", "Location", "expression")
+	if location != "auth.authorization.session.login_location" {
+		t.Errorf("unauthorized Location expression = %q", location)
+	}
+	cacheControl, _, _ := unstructured.NestedString(session.Object,
+		"spec", "rules", "response", "unauthorized", "headers", "Cache-Control", "value")
+	if cacheControl != "no-store" {
+		t.Errorf("unauthorized Cache-Control = %q, want no-store", cacheControl)
+	}
+}
+
 func TestRenderOmitsPortalResourcesUntilDashboardServiceExists(t *testing.T) {
 	built, err := render.Build(testManifestPath)
 	if err != nil {
@@ -194,6 +252,7 @@ func TestRenderOmitsPortalResourcesUntilDashboardServiceExists(t *testing.T) {
 		"HTTPRoute/" + PortalRouteName,
 		"ReferenceGrant/" + PortalRouteName,
 		"DestinationRule/" + PortalBackendTLSName,
+		"AuthPolicy/" + PortalSessionAuthPolicyName,
 	} {
 		for _, resource := range resources {
 			if resource.GetKind()+"/"+resource.GetName() == key {
@@ -203,6 +262,7 @@ func TestRenderOmitsPortalResourcesUntilDashboardServiceExists(t *testing.T) {
 	}
 	foundOAuthRoute := false
 	foundProxyTLS := false
+	foundAnonymousPolicy := false
 	for _, resource := range resources {
 		if resource.GetKind()+"/"+resource.GetName() == "HTTPRoute/"+OAuth2RouteName {
 			foundOAuthRoute = true
@@ -210,9 +270,13 @@ func TestRenderOmitsPortalResourcesUntilDashboardServiceExists(t *testing.T) {
 		if resource.GetKind()+"/"+resource.GetName() == "DestinationRule/"+AuthProxyBackendTLSName {
 			foundProxyTLS = true
 		}
+		if resource.GetKind()+"/"+resource.GetName() == "AuthPolicy/"+OAuth2AnonymousAuthPolicyName {
+			foundAnonymousPolicy = true
+		}
 	}
-	if !foundOAuthRoute || !foundProxyTLS {
-		t.Errorf("OAuth route = %v, proxy TLS = %v; both should render", foundOAuthRoute, foundProxyTLS)
+	if !foundOAuthRoute || !foundProxyTLS || !foundAnonymousPolicy {
+		t.Errorf("OAuth route = %v, proxy TLS = %v, anonymous policy = %v; all should render",
+			foundOAuthRoute, foundProxyTLS, foundAnonymousPolicy)
 	}
 }
 

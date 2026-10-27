@@ -71,6 +71,7 @@ func testScheme() *runtime.Scheme {
 		{gvkReferenceGrant.Group, gvkReferenceGrant.Version, gvkReferenceGrant.Kind},
 		{gvkDestinationRule.Group, gvkDestinationRule.Version, gvkDestinationRule.Kind},
 		{gvkDSCI.Group, gvkDSCI.Version, gvkDSCI.Kind},
+		{gvkAuthPolicy.Group, gvkAuthPolicy.Version, gvkAuthPolicy.Kind},
 	} {
 		gv := tenant.AITenantGVK.GroupVersion()
 		gv.Group, gv.Version = gvk.group, gvk.version
@@ -294,6 +295,8 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 	}
 	sort.Strings(rec.applied)
 	want := []string{
+		"AuthPolicy/" + testInfraNamespace + "/" + OAuth2AnonymousAuthPolicyName,
+		"AuthPolicy/" + testInfraNamespace + "/" + PortalSessionAuthPolicyName,
 		"Deployment/" + testInfraNamespace + "/" + AuthProxyName,
 		"DestinationRule/" + testGatewayNamespace + "/" + AuthProxyBackendTLSName,
 		"DestinationRule/" + testGatewayNamespace + "/" + PortalBackendTLSName,
@@ -336,6 +339,7 @@ func TestReconcileOmitsPortalRouteUntilDashboardServiceExists(t *testing.T) {
 		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	want := []string{
+		"AuthPolicy/" + testInfraNamespace + "/" + OAuth2AnonymousAuthPolicyName,
 		"Deployment/" + testInfraNamespace + "/" + AuthProxyName,
 		"DestinationRule/" + testGatewayNamespace + "/" + AuthProxyBackendTLSName,
 		"HTTPRoute/" + testInfraNamespace + "/" + OAuth2RouteName,
@@ -517,12 +521,17 @@ func TestCleanupRemovesPortalResourcesAcrossNamespaces(t *testing.T) {
 	referenceGrant := newManagedResource(gvkReferenceGrant, testDashboardNamespace, PortalRouteName)
 	portalTLS := newManagedResource(gvkDestinationRule, testGatewayNamespace, PortalBackendTLSName)
 	proxyTLS := newManagedResource(gvkDestinationRule, testGatewayNamespace, AuthProxyBackendTLSName)
-	r, _ := newReconciler(t, portalRoute, oauthRoute, referenceGrant, portalTLS, proxyTLS)
+	anonymousPolicy := newManagedResource(gvkAuthPolicy, testInfraNamespace, OAuth2AnonymousAuthPolicyName)
+	sessionPolicy := newManagedResource(gvkAuthPolicy, testInfraNamespace, PortalSessionAuthPolicyName)
+	r, _ := newReconciler(t, portalRoute, oauthRoute, referenceGrant, portalTLS, proxyTLS,
+		anonymousPolicy, sessionPolicy)
 
 	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
-	for _, object := range []*unstructured.Unstructured{portalRoute, oauthRoute, referenceGrant, portalTLS, proxyTLS} {
+	for _, object := range []*unstructured.Unstructured{
+		portalRoute, oauthRoute, referenceGrant, portalTLS, proxyTLS, anonymousPolicy, sessionPolicy,
+	} {
 		err := r.Client.Get(context.Background(), types.NamespacedName{
 			Namespace: object.GetNamespace(), Name: object.GetName(),
 		}, object.DeepCopy())

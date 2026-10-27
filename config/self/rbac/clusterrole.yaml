@@ -137,6 +137,10 @@ rules:
 - apiGroups: ["networking.istio.io"]
   resources: ["serviceentries"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# The consumer portal applies Kuadrant AuthPolicies to its HTTPRoutes.
+- apiGroups: ["kuadrant.io"]
+  resources: ["authpolicies"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # destinationrules already covered above (full CRUD, needed for the
 # vendored overlay's own DestinationRule), so no separate mirror rule is
 # needed here.

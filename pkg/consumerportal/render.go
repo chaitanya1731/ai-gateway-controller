@@ -74,6 +74,7 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		"CONSUMER_PORTAL_NAMESPACE", p.Namespace,
 		"CONSUMER_PORTAL_DASHBOARD_NAMESPACE", dashboardNamespace,
 		"CONSUMER_PORTAL_HOSTNAME", p.Hostname,
+		"CONSUMER_PORTAL_AUTH_PROXY_URL", "https://"+AuthProxyName+"."+p.Namespace+".svc.cluster.local:4180/oauth2/auth",
 		"CONSUMER_PORTAL_AUTH_PROXY_IMAGE", p.Image,
 		"CONSUMER_PORTAL_OIDC_ISSUER_URL", p.OIDCIssuerURL,
 		"CONSUMER_PORTAL_REDIRECT_URL", "https://"+p.Hostname+"/oauth2/callback",
@@ -125,6 +126,8 @@ func portalOnlyResource(u unstructured.Unstructured) bool {
 		return u.GetName() == PortalRouteName
 	case "DestinationRule":
 		return u.GetName() == PortalBackendTLSName
+	case "AuthPolicy":
+		return u.GetName() == PortalSessionAuthPolicyName
 	default:
 		return false
 	}

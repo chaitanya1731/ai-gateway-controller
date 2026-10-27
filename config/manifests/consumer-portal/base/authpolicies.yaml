@@ -1,0 +1,83 @@
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: maas-consumer-portal-oauth2-anonymous
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal-oauth2
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: maas-consumer-portal-oauth2
+  rules:
+    authentication:
+      public-login:
+        anonymous: {}
+        metrics: false
+        priority: 0
+---
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: maas-consumer-portal-session
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: maas-consumer-portal
+  rules:
+    authentication:
+      browser:
+        anonymous: {}
+        metrics: false
+        priority: 0
+    authorization:
+      session:
+        metrics: false
+        opa:
+          allValues: true
+          rego: |
+            allow = true
+
+            login_location := sprintf("/oauth2/start?rd=%s", [urlquery.encode(input.context.request.http.path)])
+
+            identity = result {
+              cookie := object.get(input.context.request.http.headers, "cookie", "")
+              cookie != ""
+              response := http.send({
+                "method": "GET",
+                "url": "CONSUMER_PORTAL_AUTH_PROXY_URL",
+                "headers": {"Cookie": cookie},
+                "tls_ca_cert_file": "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
+                "timeout": "2s",
+                "cache": false,
+                "enable_redirect": false,
+                "raise_error": false
+              })
+              {200, 202}[response.status_code]
+              token := object.get(response.headers, "x-auth-request-access-token", [""])[0]
+              token != ""
+              result := {"access_token": token}
+            } else = {"access_token": ""}
+        priority: 0
+    response:
+      success:
+        headers:
+          x-forwarded-access-token:
+            metrics: false
+            plain:
+              expression: auth.authorization.session.identity.access_token
+            priority: 0
+      unauthorized:
+        code: 302
+        headers:
+          Cache-Control:
+            value: no-store
+          Location:
+            expression: auth.authorization.session.login_location
+        message:
+          value: Redirecting to login

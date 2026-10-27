@@ -60,6 +60,10 @@ const (
 	PortalBackendTLSName = PortalRouteName + "-backend-tls"
 	// AuthProxyBackendTLSName enables TLS from the Gateway to the proxy.
 	AuthProxyBackendTLSName = AuthProxyName + "-backend-tls"
+	// OAuth2AnonymousAuthPolicyName keeps sign-in, callback, and logout public.
+	OAuth2AnonymousAuthPolicyName = OAuth2RouteName + "-anonymous"
+	// PortalSessionAuthPolicyName validates browser sessions on the portal route.
+	PortalSessionAuthPolicyName = PortalRouteName + "-session"
 	// DashboardServiceName is the existing dashboard BFF Service.
 	DashboardServiceName      = "maas-portal"
 	DefaultDashboardNamespace = "redhat-ods-applications"
@@ -80,6 +84,7 @@ var (
 	gvkReferenceGrant  = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "ReferenceGrant"}
 	gvkDestinationRule = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 	gvkDSCI            = schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}
+	gvkAuthPolicy      = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
 	authProxyObjects   = []schema.GroupVersionKind{
 		{Group: "apps", Version: "v1", Kind: "Deployment"},
 		{Version: "v1", Kind: "Service"},
@@ -404,6 +409,7 @@ func (r *Reconciler) cleanup(ctx context.Context, namespace string) error {
 		{gvkHTTPRoute, []string{PortalRouteName, OAuth2RouteName}},
 		{gvkReferenceGrant, []string{PortalRouteName}},
 		{gvkDestinationRule, []string{PortalBackendTLSName, AuthProxyBackendTLSName}},
+		{gvkAuthPolicy, []string{OAuth2AnonymousAuthPolicyName, PortalSessionAuthPolicyName}},
 	}
 	for _, resource := range routeResources {
 		if err := r.cleanupNamed(ctx, resource.gvk, resource.names); err != nil {
