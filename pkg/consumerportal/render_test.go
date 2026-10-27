@@ -35,25 +35,27 @@ func renderTestResources(t *testing.T) map[string]unstructured.Unstructured {
 		t.Fatalf("render.Build: %v", err)
 	}
 	resources := Render(built, Params{
-		Namespace:          testInfraNamespace,
-		Image:              "quay.io/example/kube-auth-proxy:test",
-		OIDCIssuerURL:      testIssuer,
-		Hostname:           testHostname,
-		GatewayName:        testGatewayName,
-		GatewayNamespace:   testGatewayNamespace,
-		AuthorinoNamespace: DefaultAuthorinoNamespace,
+		Namespace:             testInfraNamespace,
+		DashboardNamespace:    testDashboardNamespace,
+		Image:                 "quay.io/example/kube-auth-proxy:test",
+		OIDCIssuerURL:         testIssuer,
+		Hostname:              testHostname,
+		GatewayName:           testGatewayName,
+		GatewayNamespace:      testGatewayNamespace,
+		AuthorinoNamespace:    DefaultAuthorinoNamespace,
+		DashboardServiceReady: true,
 	})
-	byKind := map[string]unstructured.Unstructured{}
+	byName := map[string]unstructured.Unstructured{}
 	for _, u := range resources {
-		byKind[u.GetKind()] = u
+		byName[u.GetKind()+"/"+u.GetName()] = u
 	}
-	return byKind
+	return byName
 }
 
 func TestRenderSubstitutesTenantValues(t *testing.T) {
 	resources := renderTestResources(t)
 	for _, kind := range []string{"Deployment", "Service", "ServiceAccount", "NetworkPolicy"} {
-		u, ok := resources[kind]
+		u, ok := resources[kind+"/"+AuthProxyName]
 		if !ok {
 			t.Fatalf("rendered resources missing %s", kind)
 		}
@@ -72,7 +74,7 @@ func TestRenderSubstitutesTenantValues(t *testing.T) {
 		}
 	}
 
-	deployment := resources["Deployment"]
+	deployment := resources["Deployment/"+AuthProxyName]
 	containers, _, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
 	if len(containers) != 1 {
 		t.Fatalf("Deployment containers = %d, want 1", len(containers))
@@ -97,7 +99,7 @@ func TestRenderSubstitutesTenantValues(t *testing.T) {
 		}
 	}
 
-	policy := resources["NetworkPolicy"]
+	policy := resources["NetworkPolicy/"+AuthProxyName]
 	raw, err := json.Marshal(policy.Object)
 	if err != nil {
 		t.Fatalf("marshal NetworkPolicy: %v", err)
@@ -106,6 +108,111 @@ func TestRenderSubstitutesTenantValues(t *testing.T) {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("NetworkPolicy does not reference %q: %s", want, raw)
 		}
+	}
+}
+
+func TestRenderRoutesGrantAndBackendTLS(t *testing.T) {
+	resources := renderTestResources(t)
+
+	portalRoute := resources["HTTPRoute/"+PortalRouteName]
+	if portalRoute.GetNamespace() != testInfraNamespace {
+		t.Errorf("portal HTTPRoute namespace = %q, want %q", portalRoute.GetNamespace(), testInfraNamespace)
+	}
+	if hostnames, _, _ := unstructured.NestedStringSlice(portalRoute.Object, "spec", "hostnames"); len(hostnames) != 1 || hostnames[0] != testHostname {
+		t.Errorf("portal hostnames = %v, want [%s]", hostnames, testHostname)
+	}
+	parents, _, _ := unstructured.NestedSlice(portalRoute.Object, "spec", "parentRefs")
+	parent, ok := parents[0].(map[string]any)
+	if !ok {
+		t.Fatalf("portal parentRef is not an object: %#v", parents[0])
+	}
+	if parent["name"] != testGatewayName || parent["namespace"] != testGatewayNamespace {
+		t.Errorf("portal parentRef = %#v", parent)
+	}
+	rules, _, _ := unstructured.NestedSlice(portalRoute.Object, "spec", "rules")
+	if len(rules) != 2 {
+		t.Fatalf("portal rules = %d, want 2", len(rules))
+	}
+	redirectRule, _ := rules[0].(map[string]any)
+	redirectFilter, _ := redirectRule["filters"].([]any)[0].(map[string]any)
+	if redirectFilter["type"] != "RequestRedirect" {
+		t.Errorf("bare path filter = %#v, want RequestRedirect", redirectFilter)
+	}
+	backendRule, _ := rules[1].(map[string]any)
+	backendRef, _ := backendRule["backendRefs"].([]any)[0].(map[string]any)
+	if backendRef["name"] != DashboardServiceName || backendRef["namespace"] != testDashboardNamespace || backendRef["port"] != int64(8443) {
+		t.Errorf("portal backendRef = %#v", backendRef)
+	}
+	rewriteFilter, _ := backendRule["filters"].([]any)[0].(map[string]any)
+	if rewriteFilter["type"] != "URLRewrite" {
+		t.Errorf("portal path filter = %#v, want URLRewrite", rewriteFilter)
+	}
+
+	oauthRoute := resources["HTTPRoute/"+OAuth2RouteName]
+	oauthRules, _, _ := unstructured.NestedSlice(oauthRoute.Object, "spec", "rules")
+	oauthBackend, _ := oauthRules[0].(map[string]any)["backendRefs"].([]any)[0].(map[string]any)
+	if oauthBackend["name"] != AuthProxyName || oauthBackend["port"] != int64(4180) {
+		t.Errorf("OAuth backendRef = %#v", oauthBackend)
+	}
+
+	referenceGrant := resources["ReferenceGrant/"+PortalRouteName]
+	if referenceGrant.GetNamespace() != testDashboardNamespace {
+		t.Errorf("ReferenceGrant namespace = %q, want %q", referenceGrant.GetNamespace(), testDashboardNamespace)
+	}
+	from, _, _ := unstructured.NestedSlice(referenceGrant.Object, "spec", "from")
+	fromRoute, _ := from[0].(map[string]any)
+	if fromRoute["namespace"] != testInfraNamespace {
+		t.Errorf("ReferenceGrant from = %#v", fromRoute)
+	}
+
+	proxyTLS := resources["DestinationRule/"+AuthProxyBackendTLSName]
+	if proxyTLS.GetNamespace() != testGatewayNamespace {
+		t.Errorf("proxy DestinationRule namespace = %q, want %q", proxyTLS.GetNamespace(), testGatewayNamespace)
+	}
+	if host, _, _ := unstructured.NestedString(proxyTLS.Object, "spec", "host"); host != AuthProxyName+"."+testInfraNamespace+".svc.cluster.local" {
+		t.Errorf("proxy DestinationRule host = %q", host)
+	}
+	portalTLS := resources["DestinationRule/"+PortalBackendTLSName]
+	if host, _, _ := unstructured.NestedString(portalTLS.Object, "spec", "host"); host != DashboardServiceName+"."+testDashboardNamespace+".svc.cluster.local" {
+		t.Errorf("portal DestinationRule host = %q", host)
+	}
+}
+
+func TestRenderOmitsPortalResourcesUntilDashboardServiceExists(t *testing.T) {
+	built, err := render.Build(testManifestPath)
+	if err != nil {
+		t.Fatalf("render.Build: %v", err)
+	}
+	resources := Render(built, Params{
+		Namespace:          testInfraNamespace,
+		DashboardNamespace: testDashboardNamespace,
+		Hostname:           testHostname,
+		GatewayName:        testGatewayName,
+		GatewayNamespace:   testGatewayNamespace,
+	})
+	for _, key := range []string{
+		"HTTPRoute/" + PortalRouteName,
+		"ReferenceGrant/" + PortalRouteName,
+		"DestinationRule/" + PortalBackendTLSName,
+	} {
+		for _, resource := range resources {
+			if resource.GetKind()+"/"+resource.GetName() == key {
+				t.Errorf("dashboard Service missing but %s was rendered", key)
+			}
+		}
+	}
+	foundOAuthRoute := false
+	foundProxyTLS := false
+	for _, resource := range resources {
+		if resource.GetKind()+"/"+resource.GetName() == "HTTPRoute/"+OAuth2RouteName {
+			foundOAuthRoute = true
+		}
+		if resource.GetKind()+"/"+resource.GetName() == "DestinationRule/"+AuthProxyBackendTLSName {
+			foundProxyTLS = true
+		}
+	}
+	if !foundOAuthRoute || !foundProxyTLS {
+		t.Errorf("OAuth route = %v, proxy TLS = %v; both should render", foundOAuthRoute, foundProxyTLS)
 	}
 }
 

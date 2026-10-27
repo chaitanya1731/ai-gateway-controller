@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,14 +47,15 @@ import (
 )
 
 const (
-	testTenantNamespace  = "models-as-a-service"
-	testInfraNamespace   = "redhat-ai-gateway-infra"
-	testAITenantNS       = "ai-tenants"
-	testGatewayName      = "maas-default-gateway"
-	testGatewayNamespace = "openshift-ingress"
-	testHostname         = "maas.apps.example.com"
-	testIssuer           = "https://keycloak.apps.example.com/realms/tenant-a"
-	testManifestPath     = "../../config/manifests/consumer-portal/base"
+	testTenantNamespace    = "models-as-a-service"
+	testInfraNamespace     = "redhat-ai-gateway-infra"
+	testAITenantNS         = "ai-tenants"
+	testGatewayName        = "maas-default-gateway"
+	testGatewayNamespace   = "openshift-ingress"
+	testHostname           = "maas.apps.example.com"
+	testIssuer             = "https://keycloak.apps.example.com/realms/tenant-a"
+	testManifestPath       = "../../config/manifests/consumer-portal/base"
+	testDashboardNamespace = "redhat-ods-applications"
 )
 
 func testScheme() *runtime.Scheme {
@@ -65,6 +67,10 @@ func testScheme() *runtime.Scheme {
 		{tenant.MaasTenantConfigGVK.Group, tenant.MaasTenantConfigGVK.Version, tenant.MaasTenantConfigGVK.Kind},
 		{tenant.AITenantGVK.Group, tenant.AITenantGVK.Version, tenant.AITenantGVK.Kind},
 		{gvkGateway.Group, gvkGateway.Version, gvkGateway.Kind},
+		{gvkHTTPRoute.Group, gvkHTTPRoute.Version, gvkHTTPRoute.Kind},
+		{gvkReferenceGrant.Group, gvkReferenceGrant.Version, gvkReferenceGrant.Kind},
+		{gvkDestinationRule.Group, gvkDestinationRule.Version, gvkDestinationRule.Kind},
+		{gvkDSCI.Group, gvkDSCI.Version, gvkDSCI.Kind},
 	} {
 		gv := tenant.AITenantGVK.GroupVersion()
 		gv.Group, gv.Version = gvk.group, gvk.version
@@ -140,6 +146,43 @@ func newGateway(listeners ...map[string]any) *unstructured.Unstructured {
 	return u
 }
 
+func newManagedResource(gvk schema.GroupVersionKind, namespace, name string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+	u.SetName(name)
+	u.SetNamespace(namespace)
+	u.SetLabels(map[string]string{tenant.LabelManagedBy: tenant.ManagedByAIGatewayController})
+	return u
+}
+
+func newHTTPRoute(name string, ready bool) *unstructured.Unstructured {
+	u := newManagedResource(gvkHTTPRoute, testInfraNamespace, name)
+	status := "False"
+	if ready {
+		status = "True"
+	}
+	u.Object["status"] = map[string]any{"parents": []any{map[string]any{
+		"conditions": []any{
+			map[string]any{"type": "Accepted", "status": status},
+			map[string]any{"type": "ResolvedRefs", "status": status},
+		},
+	}}}
+	return u
+}
+
+func newDSCI(applicationsNamespace string) *unstructured.Unstructured {
+	u := newManagedResource(gvkDSCI, "", "default-dsci")
+	u.SetLabels(nil)
+	u.Object["spec"] = map[string]any{"applicationsNamespace": applicationsNamespace}
+	return u
+}
+
+func dashboardService() *corev1.Service {
+	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name: DashboardServiceName, Namespace: testDashboardNamespace,
+	}}
+}
+
 func httpsListener(hostname string) map[string]any {
 	return map[string]any{"name": "https", "protocol": "HTTPS", "port": int64(443), "hostname": hostname}
 }
@@ -203,12 +246,13 @@ func newReconciler(t *testing.T, objects ...client.Object) (*Reconciler, *record
 	rec := &recorder{}
 	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(objects...).WithInterceptorFuncs(rec.funcs()).Build()
 	return &Reconciler{
-		Client:         c,
-		APIReader:      c,
-		Log:            logr.Discard(),
-		ManifestPath:   testManifestPath,
-		Image:          "quay.io/example/kube-auth-proxy:test",
-		ResyncInterval: 5 * time.Minute,
+		Client:             c,
+		APIReader:          c,
+		Log:                logr.Discard(),
+		ManifestPath:       testManifestPath,
+		Image:              "quay.io/example/kube-auth-proxy:test",
+		DashboardNamespace: testDashboardNamespace,
+		ResyncInterval:     5 * time.Minute,
 	}, rec
 }
 
@@ -238,6 +282,9 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 		newAITenant(aitenantOpts{issuer: testIssuer}),
 		newGateway(httpsListener(testHostname)),
 		adminCredentialsSecret(),
+		dashboardService(),
+		newHTTPRoute(PortalRouteName, true),
+		newHTTPRoute(OAuth2RouteName, true),
 	)
 
 	res := reconcileMTC(t, r)
@@ -248,7 +295,12 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 	sort.Strings(rec.applied)
 	want := []string{
 		"Deployment/" + testInfraNamespace + "/" + AuthProxyName,
+		"DestinationRule/" + testGatewayNamespace + "/" + AuthProxyBackendTLSName,
+		"DestinationRule/" + testGatewayNamespace + "/" + PortalBackendTLSName,
+		"HTTPRoute/" + testInfraNamespace + "/" + PortalRouteName,
+		"HTTPRoute/" + testInfraNamespace + "/" + OAuth2RouteName,
 		"NetworkPolicy/" + testInfraNamespace + "/" + AuthProxyName,
+		"ReferenceGrant/" + testDashboardNamespace + "/" + PortalRouteName,
 		"Service/" + testInfraNamespace + "/" + AuthProxyName,
 		"ServiceAccount/" + testInfraNamespace + "/" + AuthProxyName,
 	}
@@ -267,6 +319,59 @@ func TestReconcileAppliesAuthProxyForDefaultTenant(t *testing.T) {
 		if kind == "GatewayConfig" {
 			t.Error("reconciler read a GatewayConfig; the auth proxy must not depend on it")
 		}
+	}
+}
+
+func TestReconcileOmitsPortalRouteUntilDashboardServiceExists(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+	)
+
+	res := reconcileMTC(t, r)
+
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+	want := []string{
+		"Deployment/" + testInfraNamespace + "/" + AuthProxyName,
+		"DestinationRule/" + testGatewayNamespace + "/" + AuthProxyBackendTLSName,
+		"HTTPRoute/" + testInfraNamespace + "/" + OAuth2RouteName,
+		"NetworkPolicy/" + testInfraNamespace + "/" + AuthProxyName,
+		"Service/" + testInfraNamespace + "/" + AuthProxyName,
+		"ServiceAccount/" + testInfraNamespace + "/" + AuthProxyName,
+	}
+	sort.Strings(rec.applied)
+	if len(rec.applied) != len(want) {
+		t.Fatalf("applied = %v, want %v", rec.applied, want)
+	}
+	for i := range want {
+		if rec.applied[i] != want[i] {
+			t.Errorf("applied[%d] = %q, want %q", i, rec.applied[i], want[i])
+		}
+	}
+}
+
+func TestReconcileRequeuesUntilRoutesAreReady(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener(testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+		newHTTPRoute(PortalRouteName, false),
+		newHTTPRoute(OAuth2RouteName, true),
+	)
+
+	res := reconcileMTC(t, r)
+
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+	if len(rec.applied) == 0 {
+		t.Fatal("resources were not applied while waiting for route status")
 	}
 }
 
@@ -403,6 +508,50 @@ func TestCleanupLeavesUnmanagedObjects(t *testing.T) {
 	}
 	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: testInfraNamespace, Name: AuthProxyName}, &appsv1.Deployment{}); err != nil {
 		t.Errorf("unmanaged Deployment was deleted: %v", err)
+	}
+}
+
+func TestCleanupRemovesPortalResourcesAcrossNamespaces(t *testing.T) {
+	portalRoute := newHTTPRoute(PortalRouteName, true)
+	oauthRoute := newHTTPRoute(OAuth2RouteName, true)
+	referenceGrant := newManagedResource(gvkReferenceGrant, testDashboardNamespace, PortalRouteName)
+	portalTLS := newManagedResource(gvkDestinationRule, testGatewayNamespace, PortalBackendTLSName)
+	proxyTLS := newManagedResource(gvkDestinationRule, testGatewayNamespace, AuthProxyBackendTLSName)
+	r, _ := newReconciler(t, portalRoute, oauthRoute, referenceGrant, portalTLS, proxyTLS)
+
+	if err := r.cleanup(context.Background(), testInfraNamespace); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	for _, object := range []*unstructured.Unstructured{portalRoute, oauthRoute, referenceGrant, portalTLS, proxyTLS} {
+		err := r.Client.Get(context.Background(), types.NamespacedName{
+			Namespace: object.GetNamespace(), Name: object.GetName(),
+		}, object.DeepCopy())
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("%s %s/%s still exists (err=%v)", object.GetObjectKind().GroupVersionKind().Kind,
+				object.GetNamespace(), object.GetName(), err)
+		}
+	}
+}
+
+func TestResolveDashboardNamespace(t *testing.T) {
+	r, _ := newReconciler(t, newDSCI("custom-dashboard"))
+	r.DashboardNamespace = ""
+	namespace, err := r.resolveDashboardNamespace(context.Background())
+	if err != nil {
+		t.Fatalf("resolveDashboardNamespace: %v", err)
+	}
+	if namespace != "custom-dashboard" {
+		t.Errorf("dashboard namespace = %q, want custom-dashboard", namespace)
+	}
+
+	r, _ = newReconciler(t)
+	r.DashboardNamespace = "flag-dashboard"
+	namespace, err = r.resolveDashboardNamespace(context.Background())
+	if err != nil {
+		t.Fatalf("resolveDashboardNamespace with flag: %v", err)
+	}
+	if namespace != "flag-dashboard" {
+		t.Errorf("flag dashboard namespace = %q, want flag-dashboard", namespace)
 	}
 }
 

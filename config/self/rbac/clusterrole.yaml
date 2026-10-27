@@ -123,6 +123,11 @@ rules:
 # uses HTTPRoute parent status, so no Namespace read is granted.
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["referencegrants"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# The consumer portal discovers the dashboard namespace from DSCInitialization
+# spec.applicationsNamespace when no override flag is supplied.
+- apiGroups: ["dscinitialization.opendatahub.io"]
+  resources: ["dscinitializations"]
   verbs: ["get", "list", "watch"]
 # The tenant reconciler checks that an AITenant's status.gatewayRef names an
 # existing Gateway before applying praxis-extproc.

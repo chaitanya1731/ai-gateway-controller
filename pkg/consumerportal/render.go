@@ -40,6 +40,7 @@ var TrustedCABundleKeys = []string{"ca-bundle.crt", "odh-ca-bundle.crt"}
 // Params are the per-tenant values substituted into the auth proxy manifests.
 type Params struct {
 	Namespace          string
+	DashboardNamespace string
 	Image              string
 	OIDCIssuerURL      string
 	Hostname           string
@@ -57,12 +58,22 @@ type Params struct {
 	CredentialsHash string
 	// RefreshInterval is the proxy --cookie-refresh value.
 	RefreshInterval time.Duration
+	// DashboardServiceReady suppresses portal-only objects until the dashboard
+	// Service exists. The auth proxy and its public OAuth route stay available.
+	DashboardServiceReady bool
 }
 
 // Render substitutes the CONSUMER_PORTAL_* tokens, places every resource in
-// the infrastructure namespace, and labels it as managed by this controller.
+// the namespace owned by its kind, and labels it as managed by this controller.
 func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unstructured {
+	dashboardNamespace := p.DashboardNamespace
+	if dashboardNamespace == "" {
+		dashboardNamespace = DefaultDashboardNamespace
+	}
 	replacer := strings.NewReplacer(
+		"CONSUMER_PORTAL_NAMESPACE", p.Namespace,
+		"CONSUMER_PORTAL_DASHBOARD_NAMESPACE", dashboardNamespace,
+		"CONSUMER_PORTAL_HOSTNAME", p.Hostname,
 		"CONSUMER_PORTAL_AUTH_PROXY_IMAGE", p.Image,
 		"CONSUMER_PORTAL_OIDC_ISSUER_URL", p.OIDCIssuerURL,
 		"CONSUMER_PORTAL_REDIRECT_URL", "https://"+p.Hostname+"/oauth2/callback",
@@ -75,8 +86,17 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 	out := make([]unstructured.Unstructured, 0, len(resources))
 	for i := range resources {
 		u := resources[i].DeepCopy()
+		if !p.DashboardServiceReady && portalOnlyResource(*u) {
+			continue
+		}
 		replaceStrings(u.Object, replacer)
 		u.SetNamespace(p.Namespace)
+		switch u.GetKind() {
+		case "ReferenceGrant":
+			u.SetNamespace(dashboardNamespace)
+		case "DestinationRule":
+			u.SetNamespace(p.GatewayNamespace)
+		}
 		labels := u.GetLabels()
 		if labels == nil {
 			labels = map[string]string{}
@@ -97,6 +117,17 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		out = append(out, *u)
 	}
 	return out
+}
+
+func portalOnlyResource(u unstructured.Unstructured) bool {
+	switch u.GetKind() {
+	case "HTTPRoute", "ReferenceGrant":
+		return u.GetName() == PortalRouteName
+	case "DestinationRule":
+		return u.GetName() == PortalBackendTLSName
+	default:
+		return false
+	}
 }
 
 // addProviderCAFiles appends a --provider-ca-file argument per CA bundle key to

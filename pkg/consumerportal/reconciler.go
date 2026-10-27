@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,6 +52,17 @@ const (
 	// platform's openshift-ingress/kube-auth-proxy, which serves the RHOAI
 	// dashboard gateway.
 	AuthProxyName = "maas-consumer-portal-auth-proxy"
+	// PortalRouteName is the authenticated dashboard route.
+	PortalRouteName = "maas-consumer-portal"
+	// OAuth2RouteName is the public kube-auth-proxy route.
+	OAuth2RouteName = PortalRouteName + "-oauth2"
+	// PortalBackendTLSName enables TLS from the Gateway to maas-portal.
+	PortalBackendTLSName = PortalRouteName + "-backend-tls"
+	// AuthProxyBackendTLSName enables TLS from the Gateway to the proxy.
+	AuthProxyBackendTLSName = AuthProxyName + "-backend-tls"
+	// DashboardServiceName is the existing dashboard BFF Service.
+	DashboardServiceName      = "maas-portal"
+	DefaultDashboardNamespace = "redhat-ods-applications"
 	// CredentialsSecretName holds OAUTH2_PROXY_CLIENT_ID,
 	// OAUTH2_PROXY_CLIENT_SECRET, and OAUTH2_PROXY_COOKIE_SECRET in the
 	// infrastructure namespace.
@@ -63,8 +75,12 @@ const (
 )
 
 var (
-	gvkGateway       = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
-	authProxyObjects = []schema.GroupVersionKind{
+	gvkGateway         = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
+	gvkHTTPRoute       = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+	gvkReferenceGrant  = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "ReferenceGrant"}
+	gvkDestinationRule = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
+	gvkDSCI            = schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}
+	authProxyObjects   = []schema.GroupVersionKind{
 		{Group: "apps", Version: "v1", Kind: "Deployment"},
 		{Version: "v1", Kind: "Service"},
 		{Version: "v1", Kind: "ServiceAccount"},
@@ -84,6 +100,8 @@ type Reconciler struct {
 	Image string
 	// AuthorinoNamespace is allowed through the auth proxy NetworkPolicy.
 	AuthorinoNamespace string
+	// DashboardNamespace overrides the DSCInitialization applicationsNamespace.
+	DashboardNamespace string
 	// ResyncInterval is the RequeueAfter used once the proxy is applied.
 	ResyncInterval time.Duration
 }
@@ -99,6 +117,8 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForSecret)).
 		// Metadata-only, so ConfigMap data is never cached.
 		WatchesMetadata(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForCABundle)).
+		WatchesMetadata(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForDashboardService)).
+		Watches(newDSCInitialization(), handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForDSCI)).
 		Complete(r)
 }
 
@@ -168,6 +188,42 @@ func (r *Reconciler) maasTenantConfigForCABundle(ctx context.Context, obj client
 		}
 	}
 	return requests
+}
+
+func (r *Reconciler) maasTenantConfigForDashboardService(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetName() != DashboardServiceName {
+		return nil
+	}
+	return r.defaultMaasTenantConfigRequests(ctx)
+}
+
+func (r *Reconciler) maasTenantConfigForDSCI(ctx context.Context, _ client.Object) []reconcile.Request {
+	return r.defaultMaasTenantConfigRequests(ctx)
+}
+
+func (r *Reconciler) defaultMaasTenantConfigRequests(ctx context.Context) []reconcile.Request {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind(tenant.MaasTenantConfigGVK.Kind + "List"))
+	if err := r.Client.List(ctx, list); err != nil {
+		r.Log.Error(err, "unable to list MaasTenantConfigs while mapping a consumer portal dependency")
+		return nil
+	}
+	requests := []reconcile.Request{}
+	for i := range list.Items {
+		if IsDefaultTenant(&list.Items[i]) {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: list.Items[i].GetNamespace(),
+				Name:      list.Items[i].GetName(),
+			}})
+		}
+	}
+	return requests
+}
+
+func newDSCInitialization() *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvkDSCI)
+	return u
 }
 
 // Reconcile applies the auth proxy when the default AITenant is ready, has a
@@ -244,29 +300,47 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	dashboardNamespace, err := r.resolveDashboardNamespace(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	dashboardServiceReady, err := r.dashboardServiceExists(ctx, dashboardNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	rendered, err := render.Build(r.ManifestPath)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render: %w", err)
 	}
 	resources := Render(rendered, Params{
-		Namespace:          infraNamespace,
-		Image:              r.Image,
-		OIDCIssuerURL:      issuerURL,
-		Hostname:           hostname,
-		GatewayName:        gatewayName,
-		GatewayNamespace:   gatewayNamespace,
-		AuthorinoNamespace: r.authorinoNamespace(),
-		ProviderCAKeys:     caKeys,
-		CABundleHash:       caBundleHash,
-		CredentialsHash:    credentialsHash,
-		RefreshInterval:    RefreshInterval(aitenant),
+		Namespace:             infraNamespace,
+		DashboardNamespace:    dashboardNamespace,
+		Image:                 r.Image,
+		OIDCIssuerURL:         issuerURL,
+		Hostname:              hostname,
+		GatewayName:           gatewayName,
+		GatewayNamespace:      gatewayNamespace,
+		AuthorinoNamespace:    r.authorinoNamespace(),
+		ProviderCAKeys:        caKeys,
+		CABundleHash:          caBundleHash,
+		CredentialsHash:       credentialsHash,
+		RefreshInterval:       RefreshInterval(aitenant),
+		DashboardServiceReady: dashboardServiceReady,
 	})
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
 	}
+	routesReady, err := r.routesReady(ctx, infraNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !routesReady {
+		log.Info("consumer portal HTTPRoutes are not ready yet; will retry")
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
 
-	log.Info("consumer portal auth proxy applied", "namespace", infraNamespace, "hostname", hostname)
+	log.Info("consumer portal auth proxy and routes applied", "namespace", infraNamespace, "hostname", hostname)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
@@ -313,17 +387,48 @@ func (r *Reconciler) cleanup(ctx context.Context, namespace string) error {
 	// Credentials the controller built are removed; an administrator's
 	// hand-made Secret is left alone.
 	secret := &corev1.Secret{}
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: CredentialsSecretName}, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: CredentialsSecretName}, secret)
+	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get Secret %s/%s: %w", namespace, CredentialsSecretName, err)
 	}
-	if secret.GetLabels()[tenant.LabelManagedBy] != tenant.ManagedByAIGatewayController {
-		return nil
+	if err == nil && secret.GetLabels()[tenant.LabelManagedBy] == tenant.ManagedByAIGatewayController {
+		if err := r.Client.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete Secret %s/%s: %w", namespace, CredentialsSecretName, err)
+		}
 	}
-	if err := r.Client.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete Secret %s/%s: %w", namespace, CredentialsSecretName, err)
+
+	routeResources := []struct {
+		gvk   schema.GroupVersionKind
+		names []string
+	}{
+		{gvkHTTPRoute, []string{PortalRouteName, OAuth2RouteName}},
+		{gvkReferenceGrant, []string{PortalRouteName}},
+		{gvkDestinationRule, []string{PortalBackendTLSName, AuthProxyBackendTLSName}},
+	}
+	for _, resource := range routeResources {
+		if err := r.cleanupNamed(ctx, resource.gvk, resource.names); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) cleanupNamed(ctx context.Context, gvk schema.GroupVersionKind, names []string) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+	if err := r.APIReader.List(ctx, list, client.MatchingLabels{
+		tenant.LabelManagedBy: tenant.ManagedByAIGatewayController,
+	}); err != nil {
+		return fmt.Errorf("list %s: %w", gvk.Kind, err)
+	}
+	for i := range list.Items {
+		obj := &list.Items[i]
+		if !slices.Contains(names, obj.GetName()) {
+			continue
+		}
+		if err := r.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), err)
+		}
 	}
 	return nil
 }
@@ -408,4 +513,86 @@ func (r *Reconciler) authorinoNamespace() string {
 		return DefaultAuthorinoNamespace
 	}
 	return r.AuthorinoNamespace
+}
+
+func (r *Reconciler) resolveDashboardNamespace(ctx context.Context) (string, error) {
+	if r.DashboardNamespace != "" {
+		return r.DashboardNamespace, nil
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(gvkDSCI.GroupVersion().WithKind(gvkDSCI.Kind + "List"))
+	if err := r.APIReader.List(ctx, list); err != nil {
+		return "", fmt.Errorf("list DSCInitializations: %w", err)
+	}
+	for i := range list.Items {
+		namespace, found, err := unstructured.NestedString(list.Items[i].Object, "spec", "applicationsNamespace")
+		if err != nil {
+			return "", fmt.Errorf("read DSCInitialization %s applicationsNamespace: %w", list.Items[i].GetName(), err)
+		}
+		if found && namespace != "" {
+			return namespace, nil
+		}
+	}
+	return DefaultDashboardNamespace, nil
+}
+
+func (r *Reconciler) dashboardServiceExists(ctx context.Context, namespace string) (bool, error) {
+	service := &corev1.Service{}
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: DashboardServiceName}, service)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get Service %s/%s: %w", namespace, DashboardServiceName, err)
+	}
+	return true, nil
+}
+
+func (r *Reconciler) routesReady(ctx context.Context, namespace string) (bool, error) {
+	for _, name := range []string{PortalRouteName, OAuth2RouteName} {
+		route := &unstructured.Unstructured{}
+		route.SetGroupVersionKind(gvkHTTPRoute)
+		err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route)
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("get HTTPRoute %s/%s: %w", namespace, name, err)
+		}
+		if !HTTPRouteReady(route) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func HTTPRouteReady(route *unstructured.Unstructured) bool {
+	parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents")
+	if len(parents) == 0 {
+		return false
+	}
+	for _, entry := range parents {
+		parent, ok := entry.(map[string]any)
+		if !ok {
+			return false
+		}
+		if !parentConditionTrue(parent, "Accepted") || !parentConditionTrue(parent, "ResolvedRefs") {
+			return false
+		}
+	}
+	return true
+}
+
+func parentConditionTrue(parent map[string]any, conditionType string) bool {
+	conditions, _, _ := unstructured.NestedSlice(parent, "conditions")
+	for _, entry := range conditions {
+		condition, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if condition["type"] == conditionType && condition["status"] == "True" {
+			return true
+		}
+	}
+	return false
 }
