@@ -261,6 +261,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		CABundleHash:       caBundleHash,
 		CredentialsHash:    credentialsHash,
 		RefreshInterval:    RefreshInterval(aitenant),
+		CookieExpire:       CookieExpire(aitenant),
 	})
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)

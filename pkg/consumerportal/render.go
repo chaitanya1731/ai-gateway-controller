@@ -57,6 +57,8 @@ type Params struct {
 	CredentialsHash string
 	// RefreshInterval is the proxy --cookie-refresh value.
 	RefreshInterval time.Duration
+	// CookieExpire is the proxy --cookie-expire value.
+	CookieExpire time.Duration
 }
 
 // Render substitutes the CONSUMER_PORTAL_* tokens, places every resource in
@@ -71,6 +73,7 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		"CONSUMER_PORTAL_GATEWAY_NAME", p.GatewayName,
 		"CONSUMER_PORTAL_AUTHORINO_NAMESPACE", p.AuthorinoNamespace,
 		"CONSUMER_PORTAL_COOKIE_REFRESH", p.RefreshInterval.String(),
+		"CONSUMER_PORTAL_COOKIE_EXPIRE", p.CookieExpire.String(),
 	)
 	out := make([]unstructured.Unstructured, 0, len(resources))
 	for i := range resources {

@@ -292,10 +292,41 @@ func TestReconcileWaitsForCredentialsSecret(t *testing.T) {
 
 func TestRefreshIntervalFallsBackAtCookieLifetime(t *testing.T) {
 	aitenant := newAITenant(aitenantOpts{issuer: testIssuer})
-	for _, value := range []string{"24h", "25h", "590h"} {
+	for _, value := range []string{"6h", "7h", "590h"} {
 		_ = unstructured.SetNestedField(aitenant.Object, value, "spec", "oidc", "refreshInterval")
 		if got := RefreshInterval(aitenant); got != DefaultRefreshInterval {
 			t.Errorf("RefreshInterval(%q) = %v, want %v", value, got, DefaultRefreshInterval)
+		}
+	}
+	// A longer cookieExpire admits refresh intervals above the default lifetime.
+	_ = unstructured.SetNestedField(aitenant.Object, "2h", "spec", "oidc", "refreshInterval")
+	_ = unstructured.SetNestedField(aitenant.Object, "4h", "spec", "oidc", "cookieExpire")
+	if got := RefreshInterval(aitenant); got != 2*time.Hour {
+		t.Errorf("RefreshInterval with cookieExpire=4h = %v, want 2h", got)
+	}
+	// A refresh interval at or above the configured cookieExpire falls back.
+	_ = unstructured.SetNestedField(aitenant.Object, "4h", "spec", "oidc", "refreshInterval")
+	if got := RefreshInterval(aitenant); got != DefaultRefreshInterval {
+		t.Errorf("RefreshInterval at cookieExpire = %v, want %v", got, DefaultRefreshInterval)
+	}
+}
+
+func TestCookieExpire(t *testing.T) {
+	cases := map[string]time.Duration{
+		"":               DefaultCookieExpire,
+		"not-a-duration": DefaultCookieExpire,
+		"-1h":            DefaultCookieExpire,
+		"0s":             DefaultCookieExpire,
+		"30m":            30 * time.Minute,
+		"168h":           168 * time.Hour,
+	}
+	for value, want := range cases {
+		aitenant := newAITenant(aitenantOpts{issuer: testIssuer})
+		if value != "" {
+			_ = unstructured.SetNestedField(aitenant.Object, value, "spec", "oidc", "cookieExpire")
+		}
+		if got := CookieExpire(aitenant); got != want {
+			t.Errorf("CookieExpire(%q) = %v, want %v", value, got, want)
 		}
 	}
 }
@@ -535,6 +566,7 @@ func TestMaasTenantConfigForCABundleFiltersConfigMaps(t *testing.T) {
 func withClientSecretRef(aitenant *unstructured.Unstructured) *unstructured.Unstructured {
 	_ = unstructured.SetNestedField(aitenant.Object, map[string]any{"name": "portal-oidc", "key": "client-secret"}, "spec", "oidc", "clientSecretRef")
 	_ = unstructured.SetNestedField(aitenant.Object, "2m", "spec", "oidc", "refreshInterval")
+	_ = unstructured.SetNestedField(aitenant.Object, "8h", "spec", "oidc", "cookieExpire")
 	return aitenant
 }
 
@@ -594,6 +626,9 @@ func TestReconcileBuildsCredentialsFromTenantClientSecret(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "--cookie-refresh=2m0s") {
 		t.Error("refreshInterval was not applied as --cookie-refresh")
+	}
+	if !strings.Contains(string(args), "--cookie-expire=8h0m0s") {
+		t.Error("cookieExpire was not applied as --cookie-expire")
 	}
 }
 
