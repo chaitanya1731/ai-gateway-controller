@@ -16,6 +16,12 @@ the in-flight MaaS translation change. The pinned MaaS source above predates
 that field; this local addition lets envtest verify that the API server retains
 the tenant setting until the MaaS pin is updated.
 
+The AITenant fixture also includes `spec.oidc.cookieExpire` (with the
+positive-duration and effective-defaults cross-field rules) from the in-flight
+MaaS change (models-as-a-service#1768). The pinned MaaS source above predates
+that field; this local addition lets envtest verify that the API server retains
+the tenant setting until the MaaS pin is updated.
+
 To refresh a dependency, download its CRDs at the desired tag or commit and
 replace the matching YAML files here. For Istio, copy only the three complete
 CRD documents listed above from the bundle, one per file. Preserve the upstream

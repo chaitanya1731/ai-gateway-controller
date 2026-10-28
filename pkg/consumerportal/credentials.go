@@ -61,12 +61,18 @@ func ClientSecretRef(aitenant *unstructured.Unstructured) (name, key string, ok 
 }
 
 // RefreshInterval returns AITenant spec.oidc.refreshInterval, or
-// DefaultRefreshInterval when unset or invalid.
+// DefaultRefreshInterval when unset or invalid. The result is always kept
+// below the effective cookie lifetime: the auth proxy refuses to start with
+// --cookie-refresh at or above --cookie-expire.
 func RefreshInterval(aitenant *unstructured.Unstructured) time.Duration {
+	expire := CookieExpire(aitenant)
 	value, _, _ := unstructured.NestedString(aitenant.Object, "spec", "oidc", "refreshInterval")
 	interval, err := time.ParseDuration(value)
-	if err != nil || interval <= 0 || interval >= CookieExpire(aitenant) {
-		return DefaultRefreshInterval
+	if err != nil || interval <= 0 || interval >= expire {
+		interval = DefaultRefreshInterval
+	}
+	if interval >= expire {
+		interval = expire / 2
 	}
 	return interval
 }

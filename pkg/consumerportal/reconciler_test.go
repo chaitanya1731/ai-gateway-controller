@@ -311,6 +311,25 @@ func TestRefreshIntervalFallsBackAtCookieLifetime(t *testing.T) {
 	}
 }
 
+func TestRefreshIntervalClampedBelowShortCookieExpire(t *testing.T) {
+	aitenant := newAITenant(aitenantOpts{issuer: testIssuer})
+	// A cookieExpire at or below the default refresh interval would stop the
+	// auth proxy from starting; the fallback must clamp below it.
+	_ = unstructured.SetNestedField(aitenant.Object, "2m", "spec", "oidc", "cookieExpire")
+	if got := RefreshInterval(aitenant); got >= 2*time.Minute {
+		t.Errorf("RefreshInterval with cookieExpire=2m = %v, want < 2m", got)
+	}
+	_ = unstructured.SetNestedField(aitenant.Object, "4m", "spec", "oidc", "cookieExpire")
+	if got := RefreshInterval(aitenant); got >= 4*time.Minute {
+		t.Errorf("RefreshInterval with cookieExpire=4m = %v, want < 4m", got)
+	}
+	// An explicit refresh interval below a short cookieExpire is honored.
+	_ = unstructured.SetNestedField(aitenant.Object, "1m", "spec", "oidc", "refreshInterval")
+	if got := RefreshInterval(aitenant); got != time.Minute {
+		t.Errorf("RefreshInterval with cookieExpire=4m, refreshInterval=1m = %v, want 1m", got)
+	}
+}
+
 func TestCookieExpire(t *testing.T) {
 	cases := map[string]time.Duration{
 		"":               DefaultCookieExpire,
